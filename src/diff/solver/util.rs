@@ -110,56 +110,71 @@ pub(super) fn normalized_cross_correlation(a: &[f64], b: &[f64], n: usize) -> f6
     c / (a_len.sqrt() * b_len.sqrt())
 }
 
-#[allow(clippy::too_many_arguments)]
+#[inline]
 pub(super) fn extract_ar_row(
-    coords: &[[isize; 2]],
+    coord_offsets: &[isize],
     num_coords: usize,
     source_origin: &[u8],
     denoised_origin: &[u8],
-    stride: usize,
+    base_index: usize,
+    buffer: &mut [f64],
+) -> f64 {
+    debug_assert!(buffer.len() > num_coords);
+    debug_assert!(coord_offsets.len() >= num_coords);
+
+    for i in 0..num_coords {
+        let index = base_index as isize + *get_dbg(coord_offsets, i);
+        debug_assert!(index >= 0);
+        let index = index as usize;
+        *get_dbg_mut(buffer, i) =
+            f64::from(*get_dbg(source_origin, index)) - f64::from(*get_dbg(denoised_origin, index));
+    }
+
+    f64::from(*get_dbg(source_origin, base_index))
+        - f64::from(*get_dbg(denoised_origin, base_index))
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+pub(super) fn extract_ar_row_with_alt(
+    coord_offsets: &[isize],
+    num_coords: usize,
+    source_origin: &[u8],
+    denoised_origin: &[u8],
+    base_index: usize,
     dec: (usize, usize),
-    alt_source_origin: Option<&[u8]>,
-    alt_denoised_origin: Option<&[u8]>,
+    alt_source_origin: &[u8],
+    alt_denoised_origin: &[u8],
     alt_stride: usize,
     x: usize,
     y: usize,
     buffer: &mut [f64],
 ) -> f64 {
-    debug_assert!(buffer.len() > num_coords);
-    debug_assert!(coords.len() >= num_coords);
+    let val = extract_ar_row(
+        coord_offsets,
+        num_coords,
+        source_origin,
+        denoised_origin,
+        base_index,
+        buffer,
+    );
 
-    for i in 0..num_coords {
-        let x_i = x as isize + get_dbg(coords, i)[0];
-        let y_i = y as isize + get_dbg(coords, i)[1];
-        debug_assert!(x_i >= 0);
-        debug_assert!(y_i >= 0);
-        let index = y_i as usize * stride + x_i as usize;
-        *get_dbg_mut(buffer, i) =
-            f64::from(*get_dbg(source_origin, index)) - f64::from(*get_dbg(denoised_origin, index));
-    }
-    let val = f64::from(*get_dbg(source_origin, y * stride + x))
-        - f64::from(*get_dbg(denoised_origin, y * stride + x));
+    let mut source_sum = 0u64;
+    let mut denoised_sum = 0u64;
+    let mut num_samples = 0usize;
 
-    if let Some(alt_source_origin) = alt_source_origin {
-        if let Some(alt_denoised_origin) = alt_denoised_origin {
-            let mut source_sum = 0u64;
-            let mut denoised_sum = 0u64;
-            let mut num_samples = 0usize;
-
-            for dy_i in 0..(1 << dec.1) {
-                let y_up = (y << dec.1) + dy_i;
-                for dx_i in 0..(1 << dec.0) {
-                    let x_up = (x << dec.0) + dx_i;
-                    let index = y_up * alt_stride + x_up;
-                    source_sum += u64::from(*get_dbg(alt_source_origin, index));
-                    denoised_sum += u64::from(*get_dbg(alt_denoised_origin, index));
-                    num_samples += 1;
-                }
-            }
-            *get_dbg_mut(buffer, num_coords) =
-                (source_sum as f64 - denoised_sum as f64) / num_samples as f64;
+    for dy_i in 0..(1 << dec.1) {
+        let y_up = (y << dec.1) + dy_i;
+        let row_index = y_up * alt_stride + (x << dec.0);
+        for dx_i in 0..(1 << dec.0) {
+            let index = row_index + dx_i;
+            source_sum += u64::from(*get_dbg(alt_source_origin, index));
+            denoised_sum += u64::from(*get_dbg(alt_denoised_origin, index));
+            num_samples += 1;
         }
     }
+    *get_dbg_mut(buffer, num_coords) =
+        (source_sum as f64 - denoised_sum as f64) / num_samples as f64;
 
     val
 }

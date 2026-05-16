@@ -4,9 +4,12 @@ use std::ops::{Add, AddAssign};
 
 use anyhow::anyhow;
 use arrayvec::ArrayVec;
+use rayon::prelude::*;
 use v_frame::{chroma::ChromaSubsampling, frame::Frame, plane::Plane};
 
-use self::util::{extract_ar_row, get_block_mean, get_noise_var, linsolve, multiply_mat};
+use self::util::{
+    extract_ar_row, extract_ar_row_with_alt, get_block_mean, get_noise_var, linsolve, multiply_mat,
+};
 use super::{BLOCK_SIZE, BLOCK_SIZE_SQUARED, NoiseStatus};
 use crate::{
     DEFAULT_GRAIN_SEED, GrainTableSegment, NUM_UV_COEFFS, NUM_UV_POINTS, NUM_Y_COEFFS,
@@ -18,6 +21,7 @@ use crate::{
 const LOW_POLY_NUM_PARAMS: usize = 3;
 const NOISE_MODEL_LAG: usize = 3;
 const BLOCK_NORMALIZATION: f64 = 255.0f64;
+const INV_BLOCK_NORMALIZATION_SQUARED: f64 = 1.0f64 / (BLOCK_NORMALIZATION * BLOCK_NORMALIZATION);
 
 #[derive(Debug, Clone)]
 pub(super) struct FlatBlockFinder {
@@ -97,12 +101,14 @@ impl FlatBlockFinder {
         let num_blocks = num_blocks_w * num_blocks_h;
         let mut flat_blocks = vec![0u8; num_blocks];
         let mut num_flat = 0;
-        let mut plane_result = [0.0f64; BLOCK_SIZE_SQUARED];
-        let mut block_result = [0.0f64; BLOCK_SIZE_SQUARED];
-        let mut scores = vec![IndexAndScore::default(); num_blocks];
+        let mut scores = (0..num_blocks)
+            .into_par_iter()
+            .map(|index| {
+                let by = index / num_blocks_w;
+                let bx = index % num_blocks_w;
+                let mut plane_result = [0.0f64; BLOCK_SIZE_SQUARED];
+                let mut block_result = [0.0f64; BLOCK_SIZE_SQUARED];
 
-        for by in 0..num_blocks_h {
-            for bx in 0..num_blocks_w {
                 // Compute gradient covariance matrix.
                 let mut gxx = 0f64;
                 let mut gxy = 0f64;
@@ -168,17 +174,28 @@ impl FlatBlockFinder {
                 // clamp the value to [-25.0, 100.0] to prevent overflow
                 let sum_weights = sum_weights.clamp(-25.0f64, 100.0f64);
                 let score = (1.0f64 / (1.0f64 + (-sum_weights).exp())) as f32;
-                let index = by * num_blocks_w + bx;
-                *get_dbg_mut(&mut flat_blocks, index) = if is_flat { 255 } else { 0 };
-                *get_dbg_mut(&mut scores, index) = IndexAndScore {
-                    score: if var > VAR_THRESHOLD { score } else { 0f32 },
+
+                (
                     index,
-                };
-                if is_flat {
-                    num_flat += 1;
-                }
+                    if is_flat { 255 } else { 0 },
+                    IndexAndScore {
+                        score: if var > VAR_THRESHOLD { score } else { 0f32 },
+                        index,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (index, flat_block, _) in &scores {
+            *get_dbg_mut(&mut flat_blocks, *index) = *flat_block;
+            if *flat_block != 0 {
+                num_flat += 1;
             }
         }
+        let mut scores = scores
+            .drain(..)
+            .map(|(_, _, score)| score)
+            .collect::<Vec<_>>();
 
         scores.sort_unstable_by(|a, b| a.score.partial_cmp(&b.score).expect("Shouldn't be NaN"));
 
@@ -330,6 +347,38 @@ impl Add<&EquationSystem> for EquationSystem {
 impl AddAssign<&EquationSystem> for EquationSystem {
     fn add_assign(&mut self, rhs: &EquationSystem) {
         *self = self.clone() + rhs;
+    }
+}
+
+fn mirror_upper_triangle(eqns: &mut EquationSystem) {
+    let n = eqns.n;
+    for i in 0..n {
+        for j in (i + 1)..n {
+            *get_dbg_mut(&mut eqns.a, j * n + i) = *get_dbg(&eqns.a, i * n + j);
+        }
+    }
+}
+
+fn scale_equation_system(eqns: &mut EquationSystem, scale: f64) {
+    for val in &mut eqns.a {
+        *val *= scale;
+    }
+    for val in &mut eqns.b {
+        *val *= scale;
+    }
+}
+
+fn add_ar_observation(eqns: &mut EquationSystem, buffer: &[f64], val: f64) {
+    let n = eqns.n;
+    for i in 0..n {
+        let buffer_i = *get_dbg(buffer, i);
+        let row_start = i * n;
+        let row = get_dbg_mut(&mut eqns.a, row_start + i..row_start + n);
+        let buffer_tail = get_dbg(buffer, i..n);
+        for (a, buffer_j) in row.iter_mut().zip(buffer_tail.iter()) {
+            *a += buffer_i * *buffer_j;
+        }
+        *get_dbg_mut(&mut eqns.b, i) += buffer_i * val;
     }
 }
 
@@ -782,11 +831,7 @@ impl NoiseModel {
         num_blocks_h: usize,
     ) {
         let num_coords = self.n;
-        let state = get_dbg_mut(&mut self.latest_state, channel);
-        let a = &mut state.eqns.a;
-        let b = &mut state.eqns.b;
-        let mut buffer = vec![0f64; num_coords + 1].into_boxed_slice();
-        let n = state.eqns.n;
+        let n = self.latest_state[channel].eqns.n;
         let block_w = BLOCK_SIZE / source.geometry().subsampling_x.get() as usize;
         let block_h = BLOCK_SIZE / source.geometry().subsampling_y.get() as usize;
 
@@ -800,66 +845,103 @@ impl NoiseModel {
         let alt_stride = alt_source.map_or(0, |s| s.geometry().stride.get());
         let alt_source_origin = alt_source.map(|s| get_dbg(s.data(), s.data_origin()..));
         let alt_denoised_origin = alt_denoised.map(|s| get_dbg(s.data(), s.data_origin()..));
-
-        for by in 0..num_blocks_h {
-            let y_o = by * block_h;
-            for bx in 0..num_blocks_w {
-                // SAFETY: We know the indexes we provide do not overflow the data bounds
-                unsafe {
-                    let flat_block_ptr = flat_blocks.as_ptr().add(by * num_blocks_w + bx);
-                    let x_o = bx * block_w;
-                    if *flat_block_ptr == 0 {
-                        continue;
+        let alt_origins = alt_source_origin.zip(alt_denoised_origin);
+        let mut coord_offsets = [0isize; NUM_Y_COEFFS];
+        for (offset, coord) in coord_offsets
+            .iter_mut()
+            .zip(self.coords.iter())
+            .take(num_coords)
+        {
+            *offset = coord[1] * stride as isize + coord[0];
+        }
+        let (eqns, num_observations) = (0..(num_blocks_w * num_blocks_h))
+            .into_par_iter()
+            .fold(
+                || (EquationSystem::new(n), 0usize, [0f64; NUM_UV_COEFFS]),
+                |(mut eqns, mut num_observations, mut buffer), block_index| {
+                    let by = block_index / num_blocks_w;
+                    let bx = block_index % num_blocks_w;
+                    let flat_block_index = by * num_blocks_w + bx;
+                    if flat_blocks[flat_block_index] == 0 {
+                        return (eqns, num_observations, buffer);
                     }
-                    let y_start = if by > 0 && *flat_block_ptr.sub(num_blocks_w) > 0 {
+
+                    let y_o = by * block_h;
+                    let x_o = bx * block_w;
+                    let y_start = if by > 0 && flat_blocks[flat_block_index - num_blocks_w] > 0 {
                         0
                     } else {
                         NOISE_MODEL_LAG
                     };
-                    let x_start = if bx > 0 && *flat_block_ptr.sub(1) > 0 {
+                    let x_start = if bx > 0 && flat_blocks[flat_block_index - 1] > 0 {
                         0
                     } else {
                         NOISE_MODEL_LAG
                     };
                     let y_end = ((frame_dims.1 >> dec.1) - by * block_h).min(block_h);
                     let x_end = ((frame_dims.0 >> dec.0) - bx * block_w - NOISE_MODEL_LAG).min(
-                        if bx + 1 < num_blocks_w && *flat_block_ptr.add(1) > 0 {
+                        if bx + 1 < num_blocks_w && flat_blocks[flat_block_index + 1] > 0 {
                             block_w
                         } else {
                             block_w - NOISE_MODEL_LAG
                         },
                     );
+
                     for y in y_start..y_end {
+                        let row_index = (y + y_o) * stride + x_o;
                         for x in x_start..x_end {
-                            let val = extract_ar_row(
-                                &self.coords,
-                                num_coords,
-                                source_origin,
-                                denoised_origin,
-                                stride,
-                                dec,
-                                alt_source_origin,
-                                alt_denoised_origin,
-                                alt_stride,
-                                x + x_o,
-                                y + y_o,
-                                &mut buffer,
-                            );
-                            for i in 0..n {
-                                for j in 0..n {
-                                    *get_dbg_mut(a, i * n + j) += (*get_dbg(&buffer, i)
-                                        * *get_dbg(&buffer, j))
-                                        / BLOCK_NORMALIZATION.powi(2);
-                                }
-                                *get_dbg_mut(b, i) +=
-                                    (*get_dbg(&buffer, i) * val) / BLOCK_NORMALIZATION.powi(2);
-                            }
-                            state.num_observations += 1;
+                            let base_index = row_index + x;
+                            let val = if let Some((alt_source_origin, alt_denoised_origin)) =
+                                alt_origins
+                            {
+                                extract_ar_row_with_alt(
+                                    &coord_offsets,
+                                    num_coords,
+                                    source_origin,
+                                    denoised_origin,
+                                    base_index,
+                                    dec,
+                                    alt_source_origin,
+                                    alt_denoised_origin,
+                                    alt_stride,
+                                    x + x_o,
+                                    y + y_o,
+                                    &mut buffer,
+                                )
+                            } else {
+                                extract_ar_row(
+                                    &coord_offsets,
+                                    num_coords,
+                                    source_origin,
+                                    denoised_origin,
+                                    base_index,
+                                    &mut buffer,
+                                )
+                            };
+                            add_ar_observation(&mut eqns, &buffer, val);
+                            num_observations += 1;
                         }
                     }
-                }
-            }
-        }
+
+                    (eqns, num_observations, buffer)
+                },
+            )
+            .map(|(mut eqns, num_observations, _)| {
+                scale_equation_system(&mut eqns, INV_BLOCK_NORMALIZATION_SQUARED);
+                mirror_upper_triangle(&mut eqns);
+                (eqns, num_observations)
+            })
+            .reduce(
+                || (EquationSystem::new(n), 0usize),
+                |(mut eqns_a, observations_a), (eqns_b, observations_b)| {
+                    eqns_a += &eqns_b;
+                    (eqns_a, observations_a + observations_b)
+                },
+            );
+
+        let state = get_dbg_mut(&mut self.latest_state, channel);
+        state.eqns = eqns;
+        state.num_observations = num_observations;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -879,73 +961,87 @@ impl NoiseModel {
         let noise_gain = get_dbg(&self.latest_state, channel).ar_gain;
         let block_w = BLOCK_SIZE / source.geometry().subsampling_x.get() as usize;
         let block_h = BLOCK_SIZE / source.geometry().subsampling_y.get() as usize;
+        let source_subsampling_x = source.geometry().subsampling_x.get() as usize;
+        let source_subsampling_y = source.geometry().subsampling_y.get() as usize;
+        let luma_strength_solver = &self.latest_state[0].strength_solver;
+        let corr = if channel > 0 {
+            let coeffs = &get_dbg(&self.latest_state, channel).eqns.x;
+            *get_dbg(coeffs, num_coords)
+        } else {
+            0f64
+        };
 
-        for by in 0..num_blocks_h {
-            let y_o = by * block_h;
-            for bx in 0..num_blocks_w {
-                let x_o = bx * block_w;
-                if *get_dbg(flat_blocks, by * num_blocks_w + bx) == 0 {
-                    continue;
-                }
-                let num_samples_h = ((frame_dims.1
-                    / source.geometry().subsampling_y.get() as usize)
-                    - by * block_h)
-                    .min(block_h);
-                let num_samples_w = ((frame_dims.0
-                    / source.geometry().subsampling_x.get() as usize)
-                    - bx * block_w)
-                    .min(block_w);
-                // Make sure that we have a reasonable amount of samples to consider the
-                // block
-                if num_samples_w * num_samples_h > BLOCK_SIZE {
-                    let block_mean = get_block_mean(
-                        alt_source.unwrap_or(source),
-                        frame_dims,
-                        x_o << (source.geometry().subsampling_x.get() >> 1),
-                        y_o << (source.geometry().subsampling_y.get() >> 1),
-                    );
-                    let noise_var = get_noise_var(
-                        source,
-                        denoised,
-                        (
-                            frame_dims.0 >> (source.geometry().subsampling_x.get() >> 1),
-                            frame_dims.1 >> (source.geometry().subsampling_y.get() >> 1),
-                        ),
-                        x_o,
-                        y_o,
-                        block_w,
-                        block_h,
-                    );
-                    // We want to remove the part of the noise that came from being
-                    // correlated with luma. Note that the noise solver for luma must
-                    // have already been run.
-                    let luma_strength = if channel > 0 {
-                        luma_gain * self.latest_state[0].strength_solver.get_value(block_mean)
-                    } else {
-                        0f64
-                    };
-                    let corr = if channel > 0 {
-                        let coeffs = &get_dbg(&self.latest_state, channel).eqns.x;
-                        *get_dbg(coeffs, num_coords)
-                    } else {
-                        0f64
-                    };
-                    // Chroma noise:
-                    //    N(0, noise_var) = N(0, uncorr_var) + corr * N(0, luma_strength^2)
-                    // The uncorrelated component:
-                    //   uncorr_var = noise_var - (corr * luma_strength)^2
-                    // But don't allow fully correlated noise (hence the max), since the
-                    // synthesis cannot model it.
-                    let uncorr_std = (noise_var / 16f64)
-                        .max((corr * luma_strength).mul_add(-(corr * luma_strength), noise_var))
-                        .sqrt();
-                    let adjusted_strength = uncorr_std / noise_gain;
-                    get_dbg_mut(&mut self.latest_state, channel)
-                        .strength_solver
-                        .add_measurement(block_mean, adjusted_strength);
-                }
-            }
-        }
+        let strength_solver = (0..(num_blocks_w * num_blocks_h))
+            .into_par_iter()
+            .fold(
+                || StrengthSolver::new(self.latest_state[channel].strength_solver.num_bins),
+                |mut strength_solver, block_index| {
+                    let by = block_index / num_blocks_w;
+                    let bx = block_index % num_blocks_w;
+                    let y_o = by * block_h;
+                    let x_o = bx * block_w;
+                    if *get_dbg(flat_blocks, by * num_blocks_w + bx) == 0 {
+                        return strength_solver;
+                    }
+                    let num_samples_h =
+                        ((frame_dims.1 / source_subsampling_y) - by * block_h).min(block_h);
+                    let num_samples_w =
+                        ((frame_dims.0 / source_subsampling_x) - bx * block_w).min(block_w);
+
+                    // Make sure that we have a reasonable amount of samples to consider the
+                    // block
+                    if num_samples_w * num_samples_h > BLOCK_SIZE {
+                        let block_mean = get_block_mean(
+                            alt_source.unwrap_or(source),
+                            frame_dims,
+                            x_o << (source.geometry().subsampling_x.get() >> 1),
+                            y_o << (source.geometry().subsampling_y.get() >> 1),
+                        );
+                        let noise_var = get_noise_var(
+                            source,
+                            denoised,
+                            (
+                                frame_dims.0 >> (source.geometry().subsampling_x.get() >> 1),
+                                frame_dims.1 >> (source.geometry().subsampling_y.get() >> 1),
+                            ),
+                            x_o,
+                            y_o,
+                            block_w,
+                            block_h,
+                        );
+                        // We want to remove the part of the noise that came from being
+                        // correlated with luma. Note that the noise solver for luma must
+                        // have already been run.
+                        let luma_strength = if channel > 0 {
+                            luma_gain * luma_strength_solver.get_value(block_mean)
+                        } else {
+                            0f64
+                        };
+                        // Chroma noise:
+                        //    N(0, noise_var) = N(0, uncorr_var) + corr * N(0, luma_strength^2)
+                        // The uncorrelated component:
+                        //   uncorr_var = noise_var - (corr * luma_strength)^2
+                        // But don't allow fully correlated noise (hence the max), since the
+                        // synthesis cannot model it.
+                        let uncorr_std = (noise_var / 16f64)
+                            .max((corr * luma_strength).mul_add(-(corr * luma_strength), noise_var))
+                            .sqrt();
+                        let adjusted_strength = uncorr_std / noise_gain;
+                        strength_solver.add_measurement(block_mean, adjusted_strength);
+                    }
+
+                    strength_solver
+                },
+            )
+            .reduce(
+                || StrengthSolver::new(self.latest_state[channel].strength_solver.num_bins),
+                |mut a, b| {
+                    a += &b;
+                    a
+                },
+            );
+
+        self.latest_state[channel].strength_solver = strength_solver;
     }
 }
 
