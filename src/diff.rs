@@ -49,10 +49,10 @@ impl DiffGenerator {
         source: &Frame<T>,
         denoised: &Frame<U>,
     ) -> Result<()> {
-        self.diff_frame_internal(
-            &frame_into_u8(source, self.source_bit_depth),
-            &frame_into_u8(denoised, self.denoised_bit_depth),
-        )
+        let source = frame_into_u8(source, self.source_bit_depth);
+        let denoised = frame_into_u8(denoised, self.denoised_bit_depth);
+
+        self.diff_frame_internal(&source, &denoised)
     }
 
     /// Finalize the state of this `DiffGenerator` and return the resulting
