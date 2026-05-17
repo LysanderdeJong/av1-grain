@@ -166,7 +166,7 @@ pub(super) fn extract_ar_row_with_alt(
 
     let mut source_sum = 0u64;
     let mut denoised_sum = 0u64;
-    let mut num_samples = 0usize;
+    let num_samples = (1 << dec.0) * (1 << dec.1);
 
     for dy_i in 0..(1 << dec.1) {
         let y_up = (y << dec.1) + dy_i;
@@ -175,7 +175,6 @@ pub(super) fn extract_ar_row_with_alt(
             let index = row_index + dx_i;
             source_sum += u64::from(*get_dbg(alt_source_origin, index));
             denoised_sum += u64::from(*get_dbg(alt_denoised_origin, index));
-            num_samples += 1;
         }
     }
     *get_dbg_mut(buffer, num_coords) =
@@ -194,16 +193,14 @@ pub(super) fn get_block_mean(
     let max_h = (frame_dims.1 - y_o).min(BLOCK_SIZE);
     let max_w = (frame_dims.0 - x_o).min(BLOCK_SIZE);
 
-    let data_origin = unsafe {
-        source
-            .data()
-            .get_unchecked(source.geometry().data_origin()..)
-    };
+    let data_origin = get_dbg(source.data(), source.geometry().data_origin()..);
+    let stride = source.geometry().stride();
     let mut block_sum = 0u64;
     for y in 0..max_h {
-        for x in 0..max_w {
-            let index = (y_o + y) * source.geometry().stride() + x_o + x;
-            block_sum += u64::from(*unsafe { data_origin.get_unchecked(index) });
+        let row_start = (y_o + y) * stride + x_o;
+        let row = get_dbg(data_origin, row_start..row_start + max_w);
+        for pixel in row {
+            block_sum += u64::from(*pixel);
         }
     }
 
@@ -223,23 +220,17 @@ pub(super) fn get_noise_var(
     let max_h = (frame_dims.1 - y_o).min(block_h);
     let max_w = (frame_dims.0 - x_o).min(block_w);
 
-    let source_origin = unsafe {
-        source
-            .data()
-            .get_unchecked(source.geometry().data_origin()..)
-    };
-    let denoised_origin = unsafe {
-        denoised
-            .data()
-            .get_unchecked(denoised.geometry().data_origin()..)
-    };
+    let source_origin = get_dbg(source.data(), source.geometry().data_origin()..);
+    let denoised_origin = get_dbg(denoised.data(), denoised.geometry().data_origin()..);
+    let stride = source.geometry().stride();
     let mut noise_var_sum = 0u64;
     let mut noise_sum = 0i64;
     for y in 0..max_h {
-        for x in 0..max_w {
-            let index = (y_o + y) * source.geometry().stride() + x_o + x;
-            let noise = i64::from(*unsafe { source_origin.get_unchecked(index) })
-                - i64::from(*unsafe { denoised_origin.get_unchecked(index) });
+        let row_start = (y_o + y) * stride + x_o;
+        let source_row = get_dbg(source_origin, row_start..row_start + max_w);
+        let denoised_row = get_dbg(denoised_origin, row_start..row_start + max_w);
+        for (source, denoised) in source_row.iter().zip(denoised_row.iter()) {
+            let noise = i64::from(*source) - i64::from(*denoised);
             noise_sum += noise;
             noise_var_sum += noise.pow(2) as u64;
         }
