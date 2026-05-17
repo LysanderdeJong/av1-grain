@@ -3,14 +3,17 @@ use std::slice::SliceIndex;
 use std::{borrow::Cow, mem::size_of};
 
 #[cfg(feature = "diff")]
-use rayon::prelude::*;
+use rayon::{prelude::*, scope};
 #[cfg(feature = "diff")]
 use v_frame::{frame::Frame, pixel::Pixel, plane::Plane};
 
 use cfg_if::cfg_if;
 
 #[cfg(feature = "diff")]
-pub fn frame_into_u8<T: Pixel>(frame: &Frame<T>, bit_depth: usize) -> Cow<'_, Frame<u8>> {
+pub fn frame_into_u8<T: Pixel + Send + Sync>(
+    frame: &Frame<T>,
+    bit_depth: usize,
+) -> Cow<'_, Frame<u8>> {
     if size_of::<T>() == 1 {
         assert_eq!(bit_depth, 8);
         // SAFETY: We know from the size check that this must be a `Frame<u8>`
@@ -29,37 +32,32 @@ pub fn frame_into_u8<T: Pixel>(frame: &Frame<T>, bit_depth: usize) -> Cow<'_, Fr
         )
         .build()
         .expect("frame should build");
-        for plane in 0..(if frame.subsampling == ChromaSubsampling::Monochrome {
-            1
+        let shift = bit_depth - 8usize;
+        if frame.subsampling == ChromaSubsampling::Monochrome {
+            convert_plane_to_u8(&frame.y_plane, &mut u8_frame.y_plane, shift);
         } else {
-            3
-        }) {
-            let in_plane = match plane {
-                0 => &frame.y_plane,
-                1 => frame
-                    .u_plane
-                    .as_ref()
-                    .expect("unreachable due to loop bounds"),
-                2 => frame
-                    .v_plane
-                    .as_ref()
-                    .expect("unreachable due to loop bounds"),
-                _ => unreachable!(),
-            };
-            let out_plane = match plane {
-                0 => &mut u8_frame.y_plane,
-                1 => u8_frame
-                    .u_plane
-                    .as_mut()
-                    .expect("unreachable due to loop bounds"),
-                2 => u8_frame
-                    .v_plane
-                    .as_mut()
-                    .expect("unreachable due to loop bounds"),
-                _ => unreachable!(),
-            };
+            let in_u = frame
+                .u_plane
+                .as_ref()
+                .expect("unreachable due to subsampling check");
+            let in_v = frame
+                .v_plane
+                .as_ref()
+                .expect("unreachable due to subsampling check");
+            let out_u = u8_frame
+                .u_plane
+                .as_mut()
+                .expect("unreachable due to subsampling check");
+            let out_v = u8_frame
+                .v_plane
+                .as_mut()
+                .expect("unreachable due to subsampling check");
 
-            convert_plane_to_u8(in_plane, out_plane, bit_depth - 8usize);
+            scope(|s| {
+                s.spawn(|_| convert_plane_to_u8(&frame.y_plane, &mut u8_frame.y_plane, shift));
+                s.spawn(|_| convert_plane_to_u8(in_u, out_u, shift));
+                s.spawn(|_| convert_plane_to_u8(in_v, out_v, shift));
+            });
         }
         Cow::Owned(u8_frame)
     } else {

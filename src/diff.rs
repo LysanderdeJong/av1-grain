@@ -1,5 +1,6 @@
 use anyhow::{Result, ensure};
 use num_rational::Rational64;
+use rayon::join;
 use v_frame::{frame::Frame, pixel::Pixel};
 
 use self::solver::{FlatBlockFinder, NoiseModel};
@@ -44,13 +45,15 @@ impl DiffGenerator {
     /// - If the frames do not have the same resolution
     /// - If the frames do not have the same chroma subsampling
     #[inline]
-    pub fn diff_frame<T: Pixel, U: Pixel>(
+    pub fn diff_frame<T: Pixel + Send + Sync, U: Pixel + Send + Sync>(
         &mut self,
         source: &Frame<T>,
         denoised: &Frame<U>,
     ) -> Result<()> {
-        let source = frame_into_u8(source, self.source_bit_depth);
-        let denoised = frame_into_u8(denoised, self.denoised_bit_depth);
+        let (source, denoised) = join(
+            || frame_into_u8(source, self.source_bit_depth),
+            || frame_into_u8(denoised, self.denoised_bit_depth),
+        );
 
         self.diff_frame_internal(&source, &denoised)
     }

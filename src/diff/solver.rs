@@ -4,7 +4,7 @@ use std::ops::{Add, AddAssign};
 
 use anyhow::anyhow;
 use arrayvec::ArrayVec;
-use rayon::prelude::*;
+use rayon::{prelude::*, scope};
 use v_frame::{chroma::ChromaSubsampling, frame::Frame, plane::Plane};
 
 use self::util::{
@@ -225,15 +225,27 @@ impl FlatBlockFinder {
         let mut plane_coords = [0f64; LOW_POLY_NUM_PARAMS];
         let mut a_t_a_inv_b = [0f64; LOW_POLY_NUM_PARAMS];
         let plane_origin = get_dbg(plane.data(), plane.data_origin()..);
+        let width = plane.width().get();
+        let height = plane.height().get();
+        let stride = plane.geometry().stride.get();
 
-        for yi in 0..BLOCK_SIZE {
-            let y = (offset_y + yi).clamp(0, plane.height().get() - 1);
-            for xi in 0..BLOCK_SIZE {
-                let x = (offset_x + xi).clamp(0, plane.width().get() - 1);
-                *get_dbg_mut(block_result, yi * BLOCK_SIZE + xi) = f64::from(*get_dbg(
-                    plane_origin,
-                    y * plane.geometry().stride.get() + x,
-                )) / BLOCK_NORMALIZATION;
+        if offset_x + BLOCK_SIZE <= width && offset_y + BLOCK_SIZE <= height {
+            for yi in 0..BLOCK_SIZE {
+                let row_start = (offset_y + yi) * stride + offset_x;
+                let row = get_dbg(plane_origin, row_start..row_start + BLOCK_SIZE);
+                let out_row = get_dbg_mut(block_result, yi * BLOCK_SIZE..(yi + 1) * BLOCK_SIZE);
+                for (out, pixel) in out_row.iter_mut().zip(row.iter()) {
+                    *out = f64::from(*pixel) / BLOCK_NORMALIZATION;
+                }
+            }
+        } else {
+            for yi in 0..BLOCK_SIZE {
+                let y = (offset_y + yi).clamp(0, height - 1);
+                for xi in 0..BLOCK_SIZE {
+                    let x = (offset_x + xi).clamp(0, width - 1);
+                    *get_dbg_mut(block_result, yi * BLOCK_SIZE + xi) =
+                        f64::from(*get_dbg(plane_origin, y * stride + x)) / BLOCK_NORMALIZATION;
+                }
             }
         }
 
@@ -331,22 +343,21 @@ impl EquationSystem {
 impl Add<&EquationSystem> for EquationSystem {
     type Output = EquationSystem;
 
-    fn add(self, addend: &EquationSystem) -> Self::Output {
-        let mut dest = self.clone();
-        let n = self.n;
-        for i in 0..n {
-            for j in 0..n {
-                *get_dbg_mut(&mut dest.a, i * n + j) += *get_dbg(&addend.a, i * n + j);
-            }
-            *get_dbg_mut(&mut dest.b, i) += *get_dbg(&addend.b, i);
-        }
-        dest
+    fn add(mut self, addend: &EquationSystem) -> Self::Output {
+        self += addend;
+        self
     }
 }
 
 impl AddAssign<&EquationSystem> for EquationSystem {
     fn add_assign(&mut self, rhs: &EquationSystem) {
-        *self = self.clone() + rhs;
+        debug_assert_eq!(self.n, rhs.n);
+        for (a, rhs_a) in self.a.iter_mut().zip(rhs.a.iter()) {
+            *a += *rhs_a;
+        }
+        for (b, rhs_b) in self.b.iter_mut().zip(rhs.b.iter()) {
+            *b += *rhs_b;
+        }
     }
 }
 
@@ -469,81 +480,89 @@ impl NoiseModel {
         }
 
         let frame_dims = (source.y_plane.width().get(), source.y_plane.height().get());
-        for channel in 0..(if source.subsampling == ChromaSubsampling::Monochrome {
+        if let Err(err) = Self::update_latest_channel(
+            0,
+            self.n,
+            &self.coords,
+            &mut self.latest_state[0],
+            &source.y_plane,
+            &denoised.y_plane,
+            None,
+            None,
+            frame_dims,
+            flat_blocks,
+            num_blocks_w,
+            num_blocks_h,
+            0f64,
+            None,
+        ) {
+            return NoiseStatus::Error(err);
+        }
+
+        let channel_count = if source.subsampling == ChromaSubsampling::Monochrome {
             1
         } else {
+            let source_u = source
+                .u_plane
+                .as_ref()
+                .expect("unreachable due to subsampling check");
+            let source_v = source
+                .v_plane
+                .as_ref()
+                .expect("unreachable due to subsampling check");
+            let denoised_u = denoised
+                .u_plane
+                .as_ref()
+                .expect("unreachable due to subsampling check");
+            let denoised_v = denoised
+                .v_plane
+                .as_ref()
+                .expect("unreachable due to subsampling check");
+            let (y_states, chroma_states) = self.latest_state.split_at_mut(1);
+            let y_state = &y_states[0];
+            let (cb_states, cr_states) = chroma_states.split_at_mut(1);
+            let luma_gain = y_state.ar_gain;
+            let luma_strength_solver = &y_state.strength_solver;
+            let cb_result = Self::update_latest_channel(
+                1,
+                self.n,
+                &self.coords,
+                &mut cb_states[0],
+                source_u,
+                denoised_u,
+                Some(&source.y_plane),
+                Some(&denoised.y_plane),
+                frame_dims,
+                flat_blocks,
+                num_blocks_w,
+                num_blocks_h,
+                luma_gain,
+                Some(luma_strength_solver),
+            );
+            let cr_result = Self::update_latest_channel(
+                2,
+                self.n,
+                &self.coords,
+                &mut cr_states[0],
+                source_v,
+                denoised_v,
+                Some(&source.y_plane),
+                Some(&denoised.y_plane),
+                frame_dims,
+                flat_blocks,
+                num_blocks_w,
+                num_blocks_h,
+                luma_gain,
+                Some(luma_strength_solver),
+            );
+            if let Err(err) = cb_result.and(cr_result) {
+                return NoiseStatus::Error(err);
+            }
             3
-        }) {
-            let source_plane = match channel {
-                0 => &source.y_plane,
-                1 => source
-                    .u_plane
-                    .as_ref()
-                    .expect("unreachable due to loop bounds"),
-                2 => source
-                    .v_plane
-                    .as_ref()
-                    .expect("unreachable due to loop bounds"),
-                _ => unreachable!(),
-            };
-            let denoised_plane = match channel {
-                0 => &denoised.y_plane,
-                1 => denoised
-                    .u_plane
-                    .as_ref()
-                    .expect("unreachable due to loop bounds"),
-                2 => denoised
-                    .v_plane
-                    .as_ref()
-                    .expect("unreachable due to loop bounds"),
-                _ => unreachable!(),
-            };
+        };
+
+        for channel in 0..channel_count {
             let is_chroma = channel > 0;
-            let alt_source = (channel > 0).then_some(&source.y_plane);
-            let alt_denoised = (channel > 0).then_some(&denoised.y_plane);
-            self.add_block_observations(
-                channel,
-                source_plane,
-                denoised_plane,
-                alt_source,
-                alt_denoised,
-                frame_dims,
-                flat_blocks,
-                num_blocks_w,
-                num_blocks_h,
-            );
-
-            if !get_dbg_mut(&mut self.latest_state, channel).ar_equation_system_solve(is_chroma) {
-                if is_chroma {
-                    get_dbg_mut(&mut self.latest_state, channel)
-                        .eqns
-                        .set_chroma_coefficient_fallback_solution();
-                } else {
-                    return NoiseStatus::Error(anyhow!(
-                        "Solving latest noise equation system failed on plane {}",
-                        channel
-                    ));
-                }
-            }
-            self.add_noise_std_observations(
-                channel,
-                source_plane,
-                denoised_plane,
-                alt_source,
-                frame_dims,
-                flat_blocks,
-                num_blocks_w,
-                num_blocks_h,
-            );
-            if !get_dbg_mut(&mut self.latest_state, channel)
-                .strength_solver
-                .solve()
-            {
-                return NoiseStatus::Error(anyhow!(
-                    "Failed to solve strength solver for latest state"
-                ));
-            }
-
             // Check noise characteristics and return if error
             let is_different = self.is_different();
             let combined_state = get_dbg_mut(&mut self.combined_state, channel);
@@ -593,18 +612,38 @@ impl NoiseModel {
         // Both the domain and the range of the scaling functions in the film_grain
         // are normalized to 8-bit (e.g., they are implicitly scaled during grain
         // synthesis).
-        let scaling_points_y = self.combined_state[0]
-            .strength_solver
-            .fit_piecewise(NUM_Y_POINTS)
-            .points;
-        let scaling_points_cb = self.combined_state[1]
-            .strength_solver
-            .fit_piecewise(NUM_UV_POINTS)
-            .points;
-        let scaling_points_cr = self.combined_state[2]
-            .strength_solver
-            .fit_piecewise(NUM_UV_POINTS)
-            .points;
+        let mut scaling_points_y = None;
+        let mut scaling_points_cb = None;
+        let mut scaling_points_cr = None;
+        scope(|s| {
+            s.spawn(|_| {
+                scaling_points_y = Some(
+                    self.combined_state[0]
+                        .strength_solver
+                        .fit_piecewise(NUM_Y_POINTS)
+                        .points,
+                );
+            });
+            s.spawn(|_| {
+                scaling_points_cb = Some(
+                    self.combined_state[1]
+                        .strength_solver
+                        .fit_piecewise(NUM_UV_POINTS)
+                        .points,
+                );
+            });
+            s.spawn(|_| {
+                scaling_points_cr = Some(
+                    self.combined_state[2]
+                        .strength_solver
+                        .fit_piecewise(NUM_UV_POINTS)
+                        .points,
+                );
+            });
+        });
+        let scaling_points_y = scaling_points_y.expect("scope task should set luma scaling points");
+        let scaling_points_cb = scaling_points_cb.expect("scope task should set Cb scaling points");
+        let scaling_points_cr = scaling_points_cr.expect("scope task should set Cr scaling points");
 
         let mut max_scaling_value: f64 = 1.0e-4f64;
         for p in scaling_points_y
@@ -818,9 +857,74 @@ impl NoiseModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn add_block_observations(
-        &mut self,
+    fn update_latest_channel(
         channel: usize,
+        model_n: usize,
+        coords: &[[isize; 2]],
+        state: &mut NoiseModelState,
+        source: &Plane<u8>,
+        denoised: &Plane<u8>,
+        alt_source: Option<&Plane<u8>>,
+        alt_denoised: Option<&Plane<u8>>,
+        frame_dims: (usize, usize),
+        flat_blocks: &[u8],
+        num_blocks_w: usize,
+        num_blocks_h: usize,
+        luma_gain: f64,
+        luma_strength_solver: Option<&StrengthSolver>,
+    ) -> anyhow::Result<()> {
+        let is_chroma = channel > 0;
+        Self::add_block_observations(
+            model_n,
+            coords,
+            state,
+            source,
+            denoised,
+            alt_source,
+            alt_denoised,
+            frame_dims,
+            flat_blocks,
+            num_blocks_w,
+            num_blocks_h,
+        );
+
+        if !state.ar_equation_system_solve(is_chroma) {
+            if is_chroma {
+                state.eqns.set_chroma_coefficient_fallback_solution();
+            } else {
+                return Err(anyhow!(
+                    "Solving latest noise equation system failed on plane {}",
+                    channel
+                ));
+            }
+        }
+
+        Self::add_noise_std_observations(
+            channel,
+            model_n,
+            state,
+            source,
+            denoised,
+            alt_source,
+            frame_dims,
+            flat_blocks,
+            num_blocks_w,
+            num_blocks_h,
+            luma_gain,
+            luma_strength_solver,
+        );
+        if !state.strength_solver.solve() {
+            return Err(anyhow!("Failed to solve strength solver for latest state"));
+        }
+
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn add_block_observations(
+        model_n: usize,
+        coords: &[[isize; 2]],
+        state: &mut NoiseModelState,
         source: &Plane<u8>,
         denoised: &Plane<u8>,
         alt_source: Option<&Plane<u8>>,
@@ -830,8 +934,8 @@ impl NoiseModel {
         num_blocks_w: usize,
         num_blocks_h: usize,
     ) {
-        let num_coords = self.n;
-        let n = self.latest_state[channel].eqns.n;
+        let num_coords = model_n;
+        let n = state.eqns.n;
         let block_w = BLOCK_SIZE / source.geometry().subsampling_x.get() as usize;
         let block_h = BLOCK_SIZE / source.geometry().subsampling_y.get() as usize;
 
@@ -847,107 +951,108 @@ impl NoiseModel {
         let alt_denoised_origin = alt_denoised.map(|s| get_dbg(s.data(), s.data_origin()..));
         let alt_origins = alt_source_origin.zip(alt_denoised_origin);
         let mut coord_offsets = [0isize; NUM_Y_COEFFS];
-        for (offset, coord) in coord_offsets
-            .iter_mut()
-            .zip(self.coords.iter())
-            .take(num_coords)
-        {
+        for (offset, coord) in coord_offsets.iter_mut().zip(coords.iter()).take(num_coords) {
             *offset = coord[1] * stride as isize + coord[0];
         }
-        let (eqns, num_observations) = (0..(num_blocks_w * num_blocks_h))
+        let observations = (0..(num_blocks_w * num_blocks_h))
             .into_par_iter()
-            .fold(
-                || (EquationSystem::new(n), 0usize, [0f64; NUM_UV_COEFFS]),
-                |(mut eqns, mut num_observations, mut buffer), block_index| {
-                    let by = block_index / num_blocks_w;
-                    let bx = block_index % num_blocks_w;
-                    let flat_block_index = by * num_blocks_w + bx;
-                    if flat_blocks[flat_block_index] == 0 {
-                        return (eqns, num_observations, buffer);
-                    }
+            .map(|block_index| {
+                let mut eqns = EquationSystem::new(n);
+                let mut num_observations = 0usize;
+                let mut buffer = [0f64; NUM_UV_COEFFS];
+                let by = block_index / num_blocks_w;
+                let bx = block_index % num_blocks_w;
+                let flat_block_index = by * num_blocks_w + bx;
+                if flat_blocks[flat_block_index] == 0 {
+                    return (eqns, num_observations);
+                }
 
-                    let y_o = by * block_h;
-                    let x_o = bx * block_w;
-                    let y_start = if by > 0 && flat_blocks[flat_block_index - num_blocks_w] > 0 {
-                        0
+                let y_o = by * block_h;
+                let x_o = bx * block_w;
+                let y_start = if by > 0 && flat_blocks[flat_block_index - num_blocks_w] > 0 {
+                    0
+                } else {
+                    NOISE_MODEL_LAG
+                };
+                let x_start = if bx > 0 && flat_blocks[flat_block_index - 1] > 0 {
+                    0
+                } else {
+                    NOISE_MODEL_LAG
+                };
+                let y_end = ((frame_dims.1 >> dec.1) - by * block_h).min(block_h);
+                let x_end = ((frame_dims.0 >> dec.0) - bx * block_w - NOISE_MODEL_LAG).min(
+                    if bx + 1 < num_blocks_w && flat_blocks[flat_block_index + 1] > 0 {
+                        block_w
                     } else {
-                        NOISE_MODEL_LAG
-                    };
-                    let x_start = if bx > 0 && flat_blocks[flat_block_index - 1] > 0 {
-                        0
-                    } else {
-                        NOISE_MODEL_LAG
-                    };
-                    let y_end = ((frame_dims.1 >> dec.1) - by * block_h).min(block_h);
-                    let x_end = ((frame_dims.0 >> dec.0) - bx * block_w - NOISE_MODEL_LAG).min(
-                        if bx + 1 < num_blocks_w && flat_blocks[flat_block_index + 1] > 0 {
-                            block_w
-                        } else {
-                            block_w - NOISE_MODEL_LAG
-                        },
-                    );
+                        block_w - NOISE_MODEL_LAG
+                    },
+                );
 
+                if let Some((alt_source_origin, alt_denoised_origin)) = alt_origins {
                     for y in y_start..y_end {
                         let row_index = (y + y_o) * stride + x_o;
                         for x in x_start..x_end {
                             let base_index = row_index + x;
-                            let val = if let Some((alt_source_origin, alt_denoised_origin)) =
-                                alt_origins
-                            {
-                                extract_ar_row_with_alt(
-                                    &coord_offsets,
-                                    num_coords,
-                                    source_origin,
-                                    denoised_origin,
-                                    base_index,
-                                    dec,
-                                    alt_source_origin,
-                                    alt_denoised_origin,
-                                    alt_stride,
-                                    x + x_o,
-                                    y + y_o,
-                                    &mut buffer,
-                                )
-                            } else {
-                                extract_ar_row(
-                                    &coord_offsets,
-                                    num_coords,
-                                    source_origin,
-                                    denoised_origin,
-                                    base_index,
-                                    &mut buffer,
-                                )
-                            };
+                            let val = extract_ar_row_with_alt(
+                                &coord_offsets,
+                                num_coords,
+                                source_origin,
+                                denoised_origin,
+                                base_index,
+                                dec,
+                                alt_source_origin,
+                                alt_denoised_origin,
+                                alt_stride,
+                                x + x_o,
+                                y + y_o,
+                                &mut buffer,
+                            );
                             add_ar_observation(&mut eqns, &buffer, val);
                             num_observations += 1;
                         }
                     }
-
-                    (eqns, num_observations, buffer)
-                },
-            )
-            .map(|(mut eqns, num_observations, _)| {
-                scale_equation_system(&mut eqns, INV_BLOCK_NORMALIZATION_SQUARED);
-                mirror_upper_triangle(&mut eqns);
+                } else {
+                    for y in y_start..y_end {
+                        let row_index = (y + y_o) * stride + x_o;
+                        for x in x_start..x_end {
+                            let base_index = row_index + x;
+                            let val = extract_ar_row(
+                                &coord_offsets,
+                                num_coords,
+                                source_origin,
+                                denoised_origin,
+                                base_index,
+                                &mut buffer,
+                            );
+                            add_ar_observation(&mut eqns, &buffer, val);
+                            num_observations += 1;
+                        }
+                    }
+                }
+                if num_observations > 0 {
+                    scale_equation_system(&mut eqns, INV_BLOCK_NORMALIZATION_SQUARED);
+                    mirror_upper_triangle(&mut eqns);
+                }
                 (eqns, num_observations)
             })
-            .reduce(
-                || (EquationSystem::new(n), 0usize),
-                |(mut eqns_a, observations_a), (eqns_b, observations_b)| {
-                    eqns_a += &eqns_b;
-                    (eqns_a, observations_a + observations_b)
-                },
-            );
+            .collect::<Vec<_>>();
 
-        let state = get_dbg_mut(&mut self.latest_state, channel);
+        let mut eqns = EquationSystem::new(n);
+        let mut num_observations = 0usize;
+        for (block_eqns, block_observations) in observations {
+            eqns += &block_eqns;
+            num_observations += block_observations;
+        }
+
         state.eqns = eqns;
         state.num_observations = num_observations;
     }
 
     #[allow(clippy::too_many_arguments)]
     fn add_noise_std_observations(
-        &mut self,
         channel: usize,
+        model_n: usize,
+        state: &mut NoiseModelState,
         source: &Plane<u8>,
         denoised: &Plane<u8>,
         alt_source: Option<&Plane<u8>>,
@@ -955,93 +1060,89 @@ impl NoiseModel {
         flat_blocks: &[u8],
         num_blocks_w: usize,
         num_blocks_h: usize,
+        luma_gain: f64,
+        luma_strength_solver: Option<&StrengthSolver>,
     ) {
-        let num_coords = self.n;
-        let luma_gain = self.latest_state[0].ar_gain;
-        let noise_gain = get_dbg(&self.latest_state, channel).ar_gain;
+        let num_coords = model_n;
+        let noise_gain = state.ar_gain;
         let block_w = BLOCK_SIZE / source.geometry().subsampling_x.get() as usize;
         let block_h = BLOCK_SIZE / source.geometry().subsampling_y.get() as usize;
         let source_subsampling_x = source.geometry().subsampling_x.get() as usize;
         let source_subsampling_y = source.geometry().subsampling_y.get() as usize;
-        let luma_strength_solver = &self.latest_state[0].strength_solver;
         let corr = if channel > 0 {
-            let coeffs = &get_dbg(&self.latest_state, channel).eqns.x;
-            *get_dbg(coeffs, num_coords)
+            *get_dbg(&state.eqns.x, num_coords)
         } else {
             0f64
         };
 
-        let strength_solver = (0..(num_blocks_w * num_blocks_h))
+        let measurements = (0..(num_blocks_w * num_blocks_h))
             .into_par_iter()
-            .fold(
-                || StrengthSolver::new(self.latest_state[channel].strength_solver.num_bins),
-                |mut strength_solver, block_index| {
-                    let by = block_index / num_blocks_w;
-                    let bx = block_index % num_blocks_w;
-                    let y_o = by * block_h;
-                    let x_o = bx * block_w;
-                    if *get_dbg(flat_blocks, by * num_blocks_w + bx) == 0 {
-                        return strength_solver;
-                    }
-                    let num_samples_h =
-                        ((frame_dims.1 / source_subsampling_y) - by * block_h).min(block_h);
-                    let num_samples_w =
-                        ((frame_dims.0 / source_subsampling_x) - bx * block_w).min(block_w);
+            .map(|block_index| {
+                let by = block_index / num_blocks_w;
+                let bx = block_index % num_blocks_w;
+                let y_o = by * block_h;
+                let x_o = bx * block_w;
+                if *get_dbg(flat_blocks, by * num_blocks_w + bx) == 0 {
+                    return None;
+                }
+                let num_samples_h =
+                    ((frame_dims.1 / source_subsampling_y) - by * block_h).min(block_h);
+                let num_samples_w =
+                    ((frame_dims.0 / source_subsampling_x) - bx * block_w).min(block_w);
 
-                    // Make sure that we have a reasonable amount of samples to consider the
-                    // block
-                    if num_samples_w * num_samples_h > BLOCK_SIZE {
-                        let block_mean = get_block_mean(
-                            alt_source.unwrap_or(source),
-                            frame_dims,
-                            x_o << (source.geometry().subsampling_x.get() >> 1),
-                            y_o << (source.geometry().subsampling_y.get() >> 1),
-                        );
-                        let noise_var = get_noise_var(
-                            source,
-                            denoised,
-                            (
-                                frame_dims.0 >> (source.geometry().subsampling_x.get() >> 1),
-                                frame_dims.1 >> (source.geometry().subsampling_y.get() >> 1),
-                            ),
-                            x_o,
-                            y_o,
-                            block_w,
-                            block_h,
-                        );
-                        // We want to remove the part of the noise that came from being
-                        // correlated with luma. Note that the noise solver for luma must
-                        // have already been run.
-                        let luma_strength = if channel > 0 {
-                            luma_gain * luma_strength_solver.get_value(block_mean)
-                        } else {
-                            0f64
-                        };
-                        // Chroma noise:
-                        //    N(0, noise_var) = N(0, uncorr_var) + corr * N(0, luma_strength^2)
-                        // The uncorrelated component:
-                        //   uncorr_var = noise_var - (corr * luma_strength)^2
-                        // But don't allow fully correlated noise (hence the max), since the
-                        // synthesis cannot model it.
-                        let uncorr_std = (noise_var / 16f64)
-                            .max((corr * luma_strength).mul_add(-(corr * luma_strength), noise_var))
-                            .sqrt();
-                        let adjusted_strength = uncorr_std / noise_gain;
-                        strength_solver.add_measurement(block_mean, adjusted_strength);
-                    }
+                // Make sure that we have a reasonable amount of samples to consider the block.
+                if num_samples_w * num_samples_h <= BLOCK_SIZE {
+                    return None;
+                }
 
-                    strength_solver
-                },
-            )
-            .reduce(
-                || StrengthSolver::new(self.latest_state[channel].strength_solver.num_bins),
-                |mut a, b| {
-                    a += &b;
-                    a
-                },
-            );
+                let block_mean = get_block_mean(
+                    alt_source.unwrap_or(source),
+                    frame_dims,
+                    x_o << (source.geometry().subsampling_x.get() >> 1),
+                    y_o << (source.geometry().subsampling_y.get() >> 1),
+                );
+                let noise_var = get_noise_var(
+                    source,
+                    denoised,
+                    (
+                        frame_dims.0 >> (source.geometry().subsampling_x.get() >> 1),
+                        frame_dims.1 >> (source.geometry().subsampling_y.get() >> 1),
+                    ),
+                    x_o,
+                    y_o,
+                    block_w,
+                    block_h,
+                );
+                // We want to remove the part of the noise that came from being
+                // correlated with luma. Note that the noise solver for luma must
+                // have already been run.
+                let luma_strength = if channel > 0 {
+                    luma_gain
+                        * luma_strength_solver
+                            .expect("luma strength solver required for chroma")
+                            .get_value(block_mean)
+                } else {
+                    0f64
+                };
+                // Chroma noise:
+                //    N(0, noise_var) = N(0, uncorr_var) + corr * N(0, luma_strength^2)
+                // The uncorrelated component:
+                //   uncorr_var = noise_var - (corr * luma_strength)^2
+                // But don't allow fully correlated noise (hence the max), since the
+                // synthesis cannot model it.
+                let uncorr_std = (noise_var / 16f64)
+                    .max((corr * luma_strength).mul_add(-(corr * luma_strength), noise_var))
+                    .sqrt();
+                Some((block_mean, uncorr_std / noise_gain))
+            })
+            .collect::<Vec<_>>();
 
-        self.latest_state[channel].strength_solver = strength_solver;
+        let mut strength_solver = StrengthSolver::new(state.strength_solver.num_bins);
+        for (block_mean, adjusted_strength) in measurements.into_iter().flatten() {
+            strength_solver.add_measurement(block_mean, adjusted_strength);
+        }
+
+        state.strength_solver = strength_solver;
     }
 }
 
@@ -1291,6 +1392,8 @@ impl Add<&StrengthSolver> for StrengthSolver {
 
 impl AddAssign<&StrengthSolver> for StrengthSolver {
     fn add_assign(&mut self, rhs: &StrengthSolver) {
-        *self = self.clone() + rhs;
+        self.eqns += &rhs.eqns;
+        self.num_equations += rhs.num_equations;
+        self.total += rhs.total;
     }
 }
