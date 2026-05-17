@@ -17,6 +17,8 @@ mod diff;
 mod estimate;
 #[cfg(feature = "parse")]
 mod parse;
+#[cfg(feature = "diff")]
+mod profile;
 mod util;
 
 use arrayvec::ArrayVec;

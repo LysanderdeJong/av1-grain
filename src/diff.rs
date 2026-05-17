@@ -4,7 +4,11 @@ use rayon::join;
 use v_frame::{frame::Frame, pixel::Pixel};
 
 use self::solver::{FlatBlockFinder, NoiseModel};
-use crate::{GrainTableSegment, util::frame_into_u8};
+use crate::{
+    GrainTableSegment,
+    profile::{self, MetricId},
+    util::frame_into_u8,
+};
 
 mod solver;
 
@@ -50,10 +54,12 @@ impl DiffGenerator {
         source: &Frame<T>,
         denoised: &Frame<U>,
     ) -> Result<()> {
-        let (source, denoised) = join(
-            || frame_into_u8(source, self.source_bit_depth),
-            || frame_into_u8(denoised, self.denoised_bit_depth),
-        );
+        let (source, denoised) = profile::time(MetricId::FrameConvert, || {
+            join(
+                || frame_into_u8(source, self.source_bit_depth),
+                || frame_into_u8(denoised, self.denoised_bit_depth),
+            )
+        });
 
         self.diff_frame_internal(&source, &denoised)
     }
@@ -63,23 +69,34 @@ impl DiffGenerator {
     #[must_use]
     #[inline]
     pub fn finish(mut self) -> Vec<GrainTableSegment> {
-        log::debug!("Updating final parameters");
-        self.grain_table.push(
-            self.noise_model
-                .get_grain_parameters(self.prev_timestamp, i64::MAX as u64),
-        );
+        let grain_table = profile::time(MetricId::Finish, || {
+            log::debug!("Updating final parameters");
+            let segment = profile::time(MetricId::GrainParameters, || {
+                self.noise_model
+                    .get_grain_parameters(self.prev_timestamp, i64::MAX as u64)
+            });
+            self.grain_table.push(segment);
 
-        self.grain_table
+            self.grain_table
+        });
+        profile::print_report();
+        grain_table
     }
 
     fn diff_frame_internal(&mut self, source: &Frame<u8>, denoised: &Frame<u8>) -> Result<()> {
-        verify_dimensions_match(source, denoised)?;
+        profile::time(MetricId::VerifyDimensions, || {
+            verify_dimensions_match(source, denoised)
+        })?;
 
-        let (flat_blocks, num_flat_blocks) = self.flat_block_finder.run(&source.y_plane);
+        let (flat_blocks, num_flat_blocks) = profile::time(MetricId::FlatBlockFinder, || {
+            self.flat_block_finder.run(&source.y_plane)
+        });
         log::debug!("Num flat blocks: {num_flat_blocks}");
 
         log::debug!("Updating noise model");
-        let status = self.noise_model.update(source, denoised, &flat_blocks);
+        let status = profile::time(MetricId::NoiseModelUpdate, || {
+            self.noise_model.update(source, denoised, &flat_blocks)
+        });
 
         if status == NoiseStatus::DifferentType {
             let cur_timestamp = self.frame_count as u64 * 10_000_000u64 * *self.fps.denom() as u64
@@ -89,11 +106,12 @@ impl DiffGenerator {
                 self.prev_timestamp,
                 cur_timestamp
             );
-            self.grain_table.push(
+            let segment = profile::time(MetricId::GrainParameters, || {
                 self.noise_model
-                    .get_grain_parameters(self.prev_timestamp, cur_timestamp),
-            );
-            self.noise_model.save_latest();
+                    .get_grain_parameters(self.prev_timestamp, cur_timestamp)
+            });
+            self.grain_table.push(segment);
+            profile::time(MetricId::SaveLatest, || self.noise_model.save_latest());
             self.prev_timestamp = cur_timestamp;
         }
         log::debug!("Noise model updated for frame {}", self.frame_count);

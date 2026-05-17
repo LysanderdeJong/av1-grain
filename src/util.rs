@@ -1,5 +1,6 @@
+use std::slice::SliceIndex;
 #[cfg(feature = "diff")]
-use std::{borrow::Cow, mem::size_of, slice::SliceIndex};
+use std::{borrow::Cow, mem::size_of};
 
 #[cfg(feature = "diff")]
 use rayon::{prelude::*, scope};
@@ -66,8 +67,8 @@ fn convert_plane_to_u8<T: Pixel>(in_plane: &Plane<T>, out_plane: &mut Plane<u8>,
 
     let in_geometry = in_plane.geometry();
     let out_geometry = out_plane.geometry();
-    debug_assert_eq!(in_geometry.width, out_geometry.width);
-    debug_assert_eq!(in_geometry.height, out_geometry.height);
+    debug_assert_eq!(in_geometry.width(), out_geometry.width());
+    debug_assert_eq!(in_geometry.height(), out_geometry.height());
 
     let width = in_geometry.width();
     let height = in_geometry.height();
@@ -154,26 +155,19 @@ pub fn get_dbg_mut<T, I: SliceIndex<[T]>>(
 
 #[cfg(all(test, feature = "diff"))]
 mod tests {
-    use std::num::{NonZeroU8, NonZeroUsize};
-
     use v_frame::{chroma::ChromaSubsampling, frame::FrameBuilder};
 
     use super::frame_into_u8;
 
     #[test]
     fn frame_into_u8_preserves_visible_high_bit_depth_pixels_with_padding() {
-        let mut frame = FrameBuilder::new(
-            NonZeroUsize::new(8).expect("non-zero constant"),
-            NonZeroUsize::new(4).expect("non-zero constant"),
-            ChromaSubsampling::Yuv420,
-            NonZeroU8::new(10).expect("non-zero constant"),
-        )
-        .luma_padding_left(2)
-        .luma_padding_right(4)
-        .luma_padding_top(2)
-        .luma_padding_bottom(2)
-        .build::<u16>()
-        .expect("valid frame");
+        let mut frame = FrameBuilder::new(8, 4, ChromaSubsampling::Yuv420, 10)
+            .luma_padding_left(2)
+            .luma_padding_right(4)
+            .luma_padding_top(2)
+            .luma_padding_bottom(2)
+            .build::<u16>()
+            .expect("valid frame");
 
         for plane_index in 0..3 {
             let plane = frame.plane_mut(plane_index).expect("plane exists");

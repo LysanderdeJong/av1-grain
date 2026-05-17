@@ -27,6 +27,7 @@ create = []
 diff = ["num-rational", "v_frame"]
 estimate = ["v_frame"]
 parse = []
+profile-diff = ["diff"]
 serialize = ["serde", "arrayvec/serde"]
 
 [profile.release]
