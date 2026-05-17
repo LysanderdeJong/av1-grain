@@ -15,6 +15,7 @@ use crate::{
     DEFAULT_GRAIN_SEED, GrainTableSegment, NUM_UV_COEFFS, NUM_UV_POINTS, NUM_Y_COEFFS,
     NUM_Y_POINTS,
     diff::solver::util::normalized_cross_correlation,
+    profile::{self, MetricId},
     util::{get_dbg, get_dbg_mut},
 };
 
@@ -380,16 +381,25 @@ fn scale_equation_system(eqns: &mut EquationSystem, scale: f64) {
 }
 
 fn add_ar_observation(eqns: &mut EquationSystem, buffer: &[f64], val: f64) {
-    let n = eqns.n;
-    for i in 0..n {
-        let buffer_i = *get_dbg(buffer, i);
-        let row_start = i * n;
-        let row = get_dbg_mut(&mut eqns.a, row_start + i..row_start + n);
-        let buffer_tail = get_dbg(buffer, i..n);
-        for (a, buffer_j) in row.iter_mut().zip(buffer_tail.iter()) {
+    match eqns.n {
+        NUM_Y_COEFFS => add_ar_observation_n::<NUM_Y_COEFFS>(eqns, buffer, val),
+        NUM_UV_COEFFS => add_ar_observation_n::<NUM_UV_COEFFS>(eqns, buffer, val),
+        _ => unreachable!("unsupported AR coefficient count"),
+    }
+}
+
+#[inline]
+fn add_ar_observation_n<const N: usize>(eqns: &mut EquationSystem, buffer: &[f64], val: f64) {
+    debug_assert_eq!(eqns.n, N);
+    debug_assert!(buffer.len() >= N);
+    debug_assert!(eqns.a.len() >= N * N);
+    debug_assert!(eqns.b.len() >= N);
+    for (i, row) in eqns.a.chunks_exact_mut(N).take(N).enumerate() {
+        let buffer_i = buffer[i];
+        for (a, buffer_j) in row[i..].iter_mut().zip(buffer[i..N].iter()) {
             *a += buffer_i * *buffer_j;
         }
-        *get_dbg_mut(&mut eqns.b, i) += buffer_i * val;
+        eqns.b[i] += buffer_i * val;
     }
 }
 
@@ -474,28 +484,35 @@ impl NoiseModel {
         }
 
         // Check that we have enough flat blocks
-        let num_blocks = flat_blocks.iter().filter(|b| **b > 0).count();
-        if num_blocks <= 1 {
+        let flat_block_indices = flat_blocks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, block)| (*block > 0).then_some(index))
+            .collect::<Vec<_>>();
+        if flat_block_indices.len() <= 1 {
             return NoiseStatus::Error(anyhow!("Not enough flat blocks to update noise estimate"));
         }
 
         let frame_dims = (source.y_plane.width().get(), source.y_plane.height().get());
-        if let Err(err) = Self::update_latest_channel(
-            0,
-            self.n,
-            &self.coords,
-            &mut self.latest_state[0],
-            &source.y_plane,
-            &denoised.y_plane,
-            None,
-            None,
-            frame_dims,
-            flat_blocks,
-            num_blocks_w,
-            num_blocks_h,
-            0f64,
-            None,
-        ) {
+        if let Err(err) = profile::time(MetricId::UpdateLatestY, || {
+            Self::update_latest_channel(
+                0,
+                self.n,
+                &self.coords,
+                &mut self.latest_state[0],
+                &source.y_plane,
+                &denoised.y_plane,
+                None,
+                None,
+                frame_dims,
+                flat_blocks,
+                &flat_block_indices,
+                num_blocks_w,
+                num_blocks_h,
+                0f64,
+                None,
+            )
+        }) {
             return NoiseStatus::Error(err);
         }
 
@@ -523,80 +540,93 @@ impl NoiseModel {
             let (cb_states, cr_states) = chroma_states.split_at_mut(1);
             let luma_gain = y_state.ar_gain;
             let luma_strength_solver = &y_state.strength_solver;
-            let cb_result = Self::update_latest_channel(
-                1,
-                self.n,
-                &self.coords,
-                &mut cb_states[0],
-                source_u,
-                denoised_u,
-                Some(&source.y_plane),
-                Some(&denoised.y_plane),
-                frame_dims,
-                flat_blocks,
-                num_blocks_w,
-                num_blocks_h,
-                luma_gain,
-                Some(luma_strength_solver),
-            );
-            let cr_result = Self::update_latest_channel(
-                2,
-                self.n,
-                &self.coords,
-                &mut cr_states[0],
-                source_v,
-                denoised_v,
-                Some(&source.y_plane),
-                Some(&denoised.y_plane),
-                frame_dims,
-                flat_blocks,
-                num_blocks_w,
-                num_blocks_h,
-                luma_gain,
-                Some(luma_strength_solver),
-            );
+            let cb_result = profile::time(MetricId::UpdateLatestCb, || {
+                Self::update_latest_channel(
+                    1,
+                    self.n,
+                    &self.coords,
+                    &mut cb_states[0],
+                    source_u,
+                    denoised_u,
+                    Some(&source.y_plane),
+                    Some(&denoised.y_plane),
+                    frame_dims,
+                    flat_blocks,
+                    &flat_block_indices,
+                    num_blocks_w,
+                    num_blocks_h,
+                    luma_gain,
+                    Some(luma_strength_solver),
+                )
+            });
+            let cr_result = profile::time(MetricId::UpdateLatestCr, || {
+                Self::update_latest_channel(
+                    2,
+                    self.n,
+                    &self.coords,
+                    &mut cr_states[0],
+                    source_v,
+                    denoised_v,
+                    Some(&source.y_plane),
+                    Some(&denoised.y_plane),
+                    frame_dims,
+                    flat_blocks,
+                    &flat_block_indices,
+                    num_blocks_w,
+                    num_blocks_h,
+                    luma_gain,
+                    Some(luma_strength_solver),
+                )
+            });
             if let Err(err) = cb_result.and(cr_result) {
                 return NoiseStatus::Error(err);
             }
             3
         };
 
-        for channel in 0..channel_count {
-            let is_chroma = channel > 0;
-            // Check noise characteristics and return if error
-            let is_different = self.is_different();
-            let combined_state = get_dbg_mut(&mut self.combined_state, channel);
-            if channel == 0 && combined_state.strength_solver.num_equations > 0 && is_different {
-                y_model_different = true;
-            }
-
-            if y_model_different {
-                continue;
-            }
-
-            combined_state.num_observations +=
-                get_dbg(&self.latest_state, channel).num_observations;
-            combined_state.eqns += &get_dbg(&self.latest_state, channel).eqns;
-            if !combined_state.ar_equation_system_solve(is_chroma) {
-                if is_chroma {
-                    combined_state
-                        .eqns
-                        .set_chroma_coefficient_fallback_solution();
-                } else {
-                    return NoiseStatus::Error(anyhow!(
-                        "Solving combined noise equation system failed on plane {}",
-                        channel
-                    ));
+        if let Err(status) = profile::time(MetricId::CombineState, || {
+            for channel in 0..channel_count {
+                let is_chroma = channel > 0;
+                // Check noise characteristics and return if error
+                let is_different = self.is_different();
+                let combined_state = get_dbg_mut(&mut self.combined_state, channel);
+                if channel == 0 && combined_state.strength_solver.num_equations > 0 && is_different
+                {
+                    y_model_different = true;
                 }
+
+                if y_model_different {
+                    continue;
+                }
+
+                combined_state.num_observations +=
+                    get_dbg(&self.latest_state, channel).num_observations;
+                combined_state.eqns += &get_dbg(&self.latest_state, channel).eqns;
+                if !combined_state.ar_equation_system_solve(is_chroma) {
+                    if is_chroma {
+                        combined_state
+                            .eqns
+                            .set_chroma_coefficient_fallback_solution();
+                    } else {
+                        return Err(NoiseStatus::Error(anyhow!(
+                            "Solving combined noise equation system failed on plane {}",
+                            channel
+                        )));
+                    }
+                }
+
+                combined_state.strength_solver +=
+                    &get_dbg(&self.latest_state, channel).strength_solver;
+
+                if !combined_state.strength_solver.solve() {
+                    return Err(NoiseStatus::Error(anyhow!(
+                        "Failed to solve strength solver for combined state"
+                    )));
+                };
             }
-
-            combined_state.strength_solver += &get_dbg(&self.latest_state, channel).strength_solver;
-
-            if !combined_state.strength_solver.solve() {
-                return NoiseStatus::Error(anyhow!(
-                    "Failed to solve strength solver for combined state"
-                ));
-            };
+            Ok(())
+        }) {
+            return status;
         }
 
         if y_model_different {
@@ -868,25 +898,34 @@ impl NoiseModel {
         alt_denoised: Option<&Plane<u8>>,
         frame_dims: (usize, usize),
         flat_blocks: &[u8],
+        flat_block_indices: &[usize],
         num_blocks_w: usize,
         num_blocks_h: usize,
         luma_gain: f64,
         luma_strength_solver: Option<&StrengthSolver>,
     ) -> anyhow::Result<()> {
         let is_chroma = channel > 0;
-        Self::add_block_observations(
-            model_n,
-            coords,
-            state,
-            source,
-            denoised,
-            alt_source,
-            alt_denoised,
-            frame_dims,
-            flat_blocks,
-            num_blocks_w,
-            num_blocks_h,
-        );
+        let add_block_metric = match channel {
+            0 => MetricId::AddBlockObservationsY,
+            1 => MetricId::AddBlockObservationsCb,
+            _ => MetricId::AddBlockObservationsCr,
+        };
+        profile::time(add_block_metric, || {
+            Self::add_block_observations(
+                model_n,
+                coords,
+                state,
+                source,
+                denoised,
+                alt_source,
+                alt_denoised,
+                frame_dims,
+                flat_blocks,
+                flat_block_indices,
+                num_blocks_w,
+                num_blocks_h,
+            );
+        });
 
         if !state.ar_equation_system_solve(is_chroma) {
             if is_chroma {
@@ -899,20 +938,28 @@ impl NoiseModel {
             }
         }
 
-        Self::add_noise_std_observations(
-            channel,
-            model_n,
-            state,
-            source,
-            denoised,
-            alt_source,
-            frame_dims,
-            flat_blocks,
-            num_blocks_w,
-            num_blocks_h,
-            luma_gain,
-            luma_strength_solver,
-        );
+        let add_noise_std_metric = match channel {
+            0 => MetricId::AddNoiseStdY,
+            1 => MetricId::AddNoiseStdCb,
+            _ => MetricId::AddNoiseStdCr,
+        };
+        profile::time(add_noise_std_metric, || {
+            Self::add_noise_std_observations(
+                channel,
+                model_n,
+                state,
+                source,
+                denoised,
+                alt_source,
+                frame_dims,
+                flat_blocks,
+                flat_block_indices,
+                num_blocks_w,
+                num_blocks_h,
+                luma_gain,
+                luma_strength_solver,
+            );
+        });
         if !state.strength_solver.solve() {
             return Err(anyhow!("Failed to solve strength solver for latest state"));
         }
@@ -931,8 +978,9 @@ impl NoiseModel {
         alt_denoised: Option<&Plane<u8>>,
         frame_dims: (usize, usize),
         flat_blocks: &[u8],
+        flat_block_indices: &[usize],
         num_blocks_w: usize,
-        num_blocks_h: usize,
+        _num_blocks_h: usize,
     ) {
         let num_coords = model_n;
         let n = state.eqns.n;
@@ -954,86 +1002,92 @@ impl NoiseModel {
         for (offset, coord) in coord_offsets.iter_mut().zip(coords.iter()).take(num_coords) {
             *offset = coord[1] * stride as isize + coord[0];
         }
-        let observations = (0..(num_blocks_w * num_blocks_h))
-            .into_par_iter()
-            .map(|block_index| {
+        const BLOCKS_PER_CHUNK: usize = 8;
+        let observations = flat_block_indices
+            .par_chunks(BLOCKS_PER_CHUNK)
+            .map(|chunk| {
+                let mut chunk_eqns = EquationSystem::new(n);
+                let mut chunk_observations = 0usize;
                 let mut eqns = EquationSystem::new(n);
-                let mut num_observations = 0usize;
                 let mut buffer = [0f64; NUM_UV_COEFFS];
-                let by = block_index / num_blocks_w;
-                let bx = block_index % num_blocks_w;
-                let flat_block_index = by * num_blocks_w + bx;
-                if flat_blocks[flat_block_index] == 0 {
-                    return (eqns, num_observations);
-                }
 
-                let y_o = by * block_h;
-                let x_o = bx * block_w;
-                let y_start = if by > 0 && flat_blocks[flat_block_index - num_blocks_w] > 0 {
-                    0
-                } else {
-                    NOISE_MODEL_LAG
-                };
-                let x_start = if bx > 0 && flat_blocks[flat_block_index - 1] > 0 {
-                    0
-                } else {
-                    NOISE_MODEL_LAG
-                };
-                let y_end = ((frame_dims.1 >> dec.1) - by * block_h).min(block_h);
-                let x_end = ((frame_dims.0 >> dec.0) - bx * block_w - NOISE_MODEL_LAG).min(
-                    if bx + 1 < num_blocks_w && flat_blocks[flat_block_index + 1] > 0 {
-                        block_w
+                for &block_index in chunk {
+                    eqns.clear();
+                    let mut num_observations = 0usize;
+                    let by = block_index / num_blocks_w;
+                    let bx = block_index % num_blocks_w;
+                    let flat_block_index = by * num_blocks_w + bx;
+
+                    let y_o = by * block_h;
+                    let x_o = bx * block_w;
+                    let y_start = if by > 0 && flat_blocks[flat_block_index - num_blocks_w] > 0 {
+                        0
                     } else {
-                        block_w - NOISE_MODEL_LAG
-                    },
-                );
+                        NOISE_MODEL_LAG
+                    };
+                    let x_start = if bx > 0 && flat_blocks[flat_block_index - 1] > 0 {
+                        0
+                    } else {
+                        NOISE_MODEL_LAG
+                    };
+                    let y_end = ((frame_dims.1 >> dec.1) - by * block_h).min(block_h);
+                    let x_end = ((frame_dims.0 >> dec.0) - bx * block_w - NOISE_MODEL_LAG).min(
+                        if bx + 1 < num_blocks_w && flat_blocks[flat_block_index + 1] > 0 {
+                            block_w
+                        } else {
+                            block_w - NOISE_MODEL_LAG
+                        },
+                    );
 
-                if let Some((alt_source_origin, alt_denoised_origin)) = alt_origins {
-                    for y in y_start..y_end {
-                        let row_index = (y + y_o) * stride + x_o;
-                        for x in x_start..x_end {
-                            let base_index = row_index + x;
-                            let val = extract_ar_row_with_alt(
-                                &coord_offsets,
-                                num_coords,
-                                source_origin,
-                                denoised_origin,
-                                base_index,
-                                dec,
-                                alt_source_origin,
-                                alt_denoised_origin,
-                                alt_stride,
-                                x + x_o,
-                                y + y_o,
-                                &mut buffer,
-                            );
-                            add_ar_observation(&mut eqns, &buffer, val);
-                            num_observations += 1;
+                    if let Some((alt_source_origin, alt_denoised_origin)) = alt_origins {
+                        for y in y_start..y_end {
+                            let row_index = (y + y_o) * stride + x_o;
+                            for x in x_start..x_end {
+                                let base_index = row_index + x;
+                                let val = extract_ar_row_with_alt(
+                                    &coord_offsets,
+                                    num_coords,
+                                    source_origin,
+                                    denoised_origin,
+                                    base_index,
+                                    dec,
+                                    alt_source_origin,
+                                    alt_denoised_origin,
+                                    alt_stride,
+                                    x + x_o,
+                                    y + y_o,
+                                    &mut buffer,
+                                );
+                                add_ar_observation(&mut eqns, &buffer, val);
+                                num_observations += 1;
+                            }
+                        }
+                    } else {
+                        for y in y_start..y_end {
+                            let row_index = (y + y_o) * stride + x_o;
+                            for x in x_start..x_end {
+                                let base_index = row_index + x;
+                                let val = extract_ar_row(
+                                    &coord_offsets,
+                                    num_coords,
+                                    source_origin,
+                                    denoised_origin,
+                                    base_index,
+                                    &mut buffer,
+                                );
+                                add_ar_observation(&mut eqns, &buffer, val);
+                                num_observations += 1;
+                            }
                         }
                     }
-                } else {
-                    for y in y_start..y_end {
-                        let row_index = (y + y_o) * stride + x_o;
-                        for x in x_start..x_end {
-                            let base_index = row_index + x;
-                            let val = extract_ar_row(
-                                &coord_offsets,
-                                num_coords,
-                                source_origin,
-                                denoised_origin,
-                                base_index,
-                                &mut buffer,
-                            );
-                            add_ar_observation(&mut eqns, &buffer, val);
-                            num_observations += 1;
-                        }
+                    if num_observations > 0 {
+                        scale_equation_system(&mut eqns, INV_BLOCK_NORMALIZATION_SQUARED);
+                        mirror_upper_triangle(&mut eqns);
+                        chunk_eqns += &eqns;
+                        chunk_observations += num_observations;
                     }
                 }
-                if num_observations > 0 {
-                    scale_equation_system(&mut eqns, INV_BLOCK_NORMALIZATION_SQUARED);
-                    mirror_upper_triangle(&mut eqns);
-                }
-                (eqns, num_observations)
+                (chunk_eqns, chunk_observations)
             })
             .collect::<Vec<_>>();
 
@@ -1057,9 +1111,10 @@ impl NoiseModel {
         denoised: &Plane<u8>,
         alt_source: Option<&Plane<u8>>,
         frame_dims: (usize, usize),
-        flat_blocks: &[u8],
+        _flat_blocks: &[u8],
+        flat_block_indices: &[usize],
         num_blocks_w: usize,
-        num_blocks_h: usize,
+        _num_blocks_h: usize,
         luma_gain: f64,
         luma_strength_solver: Option<&StrengthSolver>,
     ) {
@@ -1075,16 +1130,13 @@ impl NoiseModel {
             0f64
         };
 
-        let measurements = (0..(num_blocks_w * num_blocks_h))
-            .into_par_iter()
-            .map(|block_index| {
+        let measurements = flat_block_indices
+            .par_iter()
+            .map(|&block_index| {
                 let by = block_index / num_blocks_w;
                 let bx = block_index % num_blocks_w;
                 let y_o = by * block_h;
                 let x_o = bx * block_w;
-                if *get_dbg(flat_blocks, by * num_blocks_w + bx) == 0 {
-                    return None;
-                }
                 let num_samples_h =
                     ((frame_dims.1 / source_subsampling_y) - by * block_h).min(block_h);
                 let num_samples_w =

@@ -83,6 +83,15 @@ pub(super) fn multiply_mat(
     assert!(res.len() >= m1_rows * m2_cols);
     assert!(m1.len() >= m1_rows * inner_dim);
     assert!(m2.len() >= m2_cols * inner_dim);
+    if m1_rows == 1 && m2_cols == 3 {
+        multiply_row_by_3_cols(m1, m2, res, inner_dim);
+        return;
+    }
+    if inner_dim == 3 && m2_cols == 1 {
+        multiply_3_cols_by_col(m1, m2, res, m1_rows);
+        return;
+    }
+
     let mut idx = 0;
     for row in 0..m1_rows {
         for col in 0..m2_cols {
@@ -94,6 +103,29 @@ pub(super) fn multiply_mat(
             *get_dbg_mut(res, idx) = sum;
             idx += 1;
         }
+    }
+}
+
+#[inline]
+fn multiply_row_by_3_cols(m1: &[f64], m2: &[f64], res: &mut [f64], inner_dim: usize) {
+    let mut sum0 = 0f64;
+    let mut sum1 = 0f64;
+    let mut sum2 = 0f64;
+    for (m1_val, m2_row) in m1.iter().take(inner_dim).zip(m2.chunks_exact(3)) {
+        sum0 += *m1_val * m2_row[0];
+        sum1 += *m1_val * m2_row[1];
+        sum2 += *m1_val * m2_row[2];
+    }
+    res[0] = sum0;
+    res[1] = sum1;
+    res[2] = sum2;
+}
+
+#[inline]
+fn multiply_3_cols_by_col(m1: &[f64], m2: &[f64], res: &mut [f64], m1_rows: usize) {
+    debug_assert!(m2.len() >= 3);
+    for (out, row) in res.iter_mut().take(m1_rows).zip(m1.chunks_exact(3)) {
+        *out = row[0] * m2[0] + row[1] * m2[1] + row[2] * m2[2];
     }
 }
 
@@ -190,12 +222,12 @@ pub(super) fn get_block_mean(
 
     let data_origin = get_dbg(source.data(), source.data_origin()..);
     let stride = source.geometry().stride.get();
-    let mut block_sum = 0u64;
+    let mut block_sum = 0u32;
     for y in 0..max_h {
         let row_start = (y_o + y) * stride + x_o;
         let row = get_dbg(data_origin, row_start..row_start + max_w);
         for pixel in row {
-            block_sum += u64::from(*pixel);
+            block_sum += u32::from(*pixel);
         }
     }
 
@@ -218,16 +250,17 @@ pub(super) fn get_noise_var(
     let source_origin = get_dbg(source.data(), source.data_origin()..);
     let denoised_origin = get_dbg(denoised.data(), denoised.data_origin()..);
     let stride = source.geometry().stride.get();
-    let mut noise_var_sum = 0u64;
-    let mut noise_sum = 0i64;
+    let mut noise_var_sum = 0u32;
+    let mut noise_sum = 0i32;
     for y in 0..max_h {
         let row_start = (y_o + y) * stride + x_o;
         let source_row = get_dbg(source_origin, row_start..row_start + max_w);
         let denoised_row = get_dbg(denoised_origin, row_start..row_start + max_w);
         for (source, denoised) in source_row.iter().zip(denoised_row.iter()) {
-            let noise = i64::from(*source) - i64::from(*denoised);
+            let noise = i32::from(*source) - i32::from(*denoised);
             noise_sum += noise;
-            noise_var_sum += noise.pow(2) as u64;
+            let abs_noise = noise.unsigned_abs();
+            noise_var_sum += abs_noise * abs_noise;
         }
     }
 
