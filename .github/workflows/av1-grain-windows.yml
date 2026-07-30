@@ -16,6 +16,9 @@ on:
 
 jobs:
   build-test:
+    permissions:
+      checks: write
+      contents: read
     runs-on: windows-latest
 
     steps:
@@ -53,6 +56,8 @@ jobs:
 
   static-code-analysis:
     needs: [build-test]
+    permissions:
+      contents: read
     runs-on: windows-latest
 
     steps:

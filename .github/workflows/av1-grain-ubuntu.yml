@@ -10,6 +10,9 @@ on:
 
 jobs:
   build-test:
+    permissions:
+      checks: write
+      contents: read
     runs-on: ubuntu-latest
 
     steps:
@@ -56,6 +59,8 @@ jobs:
 
   code-coverage:
     needs: [build-test]
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
 
     steps:
@@ -78,6 +83,8 @@ jobs:
 
   memory-and-threads-dynamic-analysis:
     needs: [build-test]
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
 
     steps:
@@ -106,6 +113,8 @@ jobs:
 
   undefined-behaviour-fuzzy-dynamic-analysis:
     needs: [build-test]
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
 
     steps:
@@ -157,6 +166,8 @@ jobs:
 
   static-code-analysis:
     needs: [build-test]
+    permissions:
+      contents: read
     runs-on: ubuntu-latest
 
     steps:

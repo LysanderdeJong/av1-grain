@@ -10,6 +10,9 @@ on:
 
 jobs:
   build-test:
+    permissions:
+      checks: write
+      contents: read
     strategy:
       matrix:
         platform: [ubuntu-latest, macos-latest, windows-latest]
