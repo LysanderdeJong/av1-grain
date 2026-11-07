@@ -804,4 +804,34 @@ mod tests {
         assert_eq!(est.frames_without_estimate, 8);
         assert_eq!(est.segments.len(), 1);
     }
+
+    #[test]
+    fn colour_grain_on_one_plane_drops_both() {
+        // AV1 4:2:0 forbids scaling points on only one chroma plane.
+        let clean_y = clean_luma(false);
+        let clean_c = flat(CW * CH, 128);
+        let pairs: Vec<Pair> = (0..8)
+            .map(|i| {
+                let noise = white(&mut rng_for(14, i, 0), W * H, 3.0);
+                let cb_noise = white(&mut rng_for(14, i, 1), CW * CH, 2.0);
+                (
+                    frame(
+                        &quantize(&clean_y, &noise),
+                        &quantize(&clean_c, &cb_noise),
+                        &clean_c,
+                    ),
+                    frame(&clean_y, &clean_c, &clean_c),
+                )
+            })
+            .collect();
+        let est = estimate(&pairs, &[]);
+        let seg = first_segment(&est);
+        assert_eq!(
+            seg.scaling_points_cb.is_empty(),
+            seg.scaling_points_cr.is_empty(),
+            "cb {:?} cr {:?}",
+            seg.scaling_points_cb,
+            seg.scaling_points_cr
+        );
+    }
 }
