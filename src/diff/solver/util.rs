@@ -239,6 +239,81 @@ pub(super) fn get_block_mean(
     block_sum as f64 / (max_w * max_h) as f64
 }
 
+/// Least-squares plane through `source - denoised` over a block: the brightness offset and
+/// gentle gradient a denoiser leaves behind, which are not grain.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct DiffPlane {
+    /// Pixels the plane was fitted to.
+    pub samples: usize,
+    mean: f64,
+    gx: f64,
+    gy: f64,
+    cx: f64,
+    cy: f64,
+}
+
+impl DiffPlane {
+    #[must_use]
+    pub fn fit(
+        source: &Plane<u8>,
+        denoised: &Plane<u8>,
+        frame_dims: (usize, usize),
+        x_o: usize,
+        y_o: usize,
+        block_w: usize,
+        block_h: usize,
+    ) -> Self {
+        let max_h = (frame_dims.1 - y_o).min(block_h);
+        let max_w = (frame_dims.0 - x_o).min(block_w);
+        // Centred coordinates make the mean and both slopes independent fits.
+        let cx = (max_w as f64 - 1f64) / 2f64;
+        let cy = (max_h as f64 - 1f64) / 2f64;
+
+        let source_origin = get_dbg(source.data(), source.geometry().data_origin()..);
+        let denoised_origin = get_dbg(denoised.data(), denoised.geometry().data_origin()..);
+        let stride = source.geometry().stride();
+        let (mut sum, mut sum_u, mut sum_v, mut sum_uu, mut sum_vv) =
+            (0f64, 0f64, 0f64, 0f64, 0f64);
+        for y in 0..max_h {
+            let v = y as f64 - cy;
+            let row_start = (y_o + y) * stride + x_o;
+            let source_row = get_dbg(source_origin, row_start..row_start + max_w);
+            let denoised_row = get_dbg(denoised_origin, row_start..row_start + max_w);
+            for (x, (source, denoised)) in source_row.iter().zip(denoised_row.iter()).enumerate() {
+                let u = x as f64 - cx;
+                let d = f64::from(*source) - f64::from(*denoised);
+                sum += d;
+                sum_u += u * d;
+                sum_v += v * d;
+                sum_uu += u * u;
+                sum_vv += v * v;
+            }
+        }
+        let slope = |num: f64, den: f64| if den > 0f64 { num / den } else { 0f64 };
+        Self {
+            samples: max_w * max_h,
+            mean: sum / (max_w * max_h) as f64,
+            gx: slope(sum_u, sum_uu),
+            gy: slope(sum_v, sum_vv),
+            cx: x_o as f64 + cx,
+            cy: y_o as f64 + cy,
+        }
+    }
+
+    /// The plane's value at plane coordinates `(x, y)`.
+    #[must_use]
+    pub fn at(&self, x: f64, y: f64) -> f64 {
+        self.gy
+            .mul_add(y - self.cy, self.gx.mul_add(x - self.cx, self.mean))
+    }
+
+    /// How much the plane rises from a pixel to its neighbour at offset `(dx, dy)`.
+    #[must_use]
+    pub fn step(&self, dx: isize, dy: isize) -> f64 {
+        self.gx.mul_add(dx as f64, self.gy * dy as f64)
+    }
+}
+
 #[must_use]
 pub(super) fn get_noise_var(
     source: &Plane<u8>,
