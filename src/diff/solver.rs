@@ -659,13 +659,13 @@ impl NoiseModel {
         // become coloured specks.
         let luma_strength = self.combined_state[0].strength_solver.average_strength();
         let chroma_floor = CHROMA_FLOOR.max(CHROMA_SHARE_OF_LUMA * luma_strength);
-        for (points, state) in [
-            (&mut scaling_points_cb, &self.combined_state[1]),
-            (&mut scaling_points_cr, &self.combined_state[2]),
-        ] {
-            if state.strength_solver.average_strength() < chroma_floor {
-                points.clear();
-            }
+        // Cb and Cr go together: with 4:2:0, AV1 forbids points on one chroma plane only.
+        if self.combined_state[1..]
+            .iter()
+            .any(|state| state.strength_solver.average_strength() < chroma_floor)
+        {
+            scaling_points_cb.clear();
+            scaling_points_cr.clear();
         }
 
         let mut max_scaling_value: f64 = 1.0e-4f64;
