@@ -2,10 +2,10 @@ use std::ptr;
 
 use v_frame::plane::Plane;
 
-use crate::{
-    diff::BLOCK_SIZE,
-    util::{get_dbg, get_dbg_mut},
-};
+#[cfg(test)]
+use crate::util::get_dbg_mut;
+
+use crate::{diff::BLOCK_SIZE, util::get_dbg};
 
 /// Solves Ax = b, where x and b are column vectors of size nx1 and A is nxn
 #[allow(clippy::many_single_char_names)]
@@ -148,6 +148,7 @@ pub(super) fn normalized_cross_correlation(a: &[f64], b: &[f64], n: usize) -> f6
 }
 
 #[inline]
+#[cfg(test)]
 pub(super) fn extract_ar_row(
     coord_offsets: &[isize],
     num_coords: usize,
@@ -173,6 +174,7 @@ pub(super) fn extract_ar_row(
 
 #[allow(clippy::too_many_arguments)]
 #[inline]
+#[cfg(test)]
 pub(super) fn extract_ar_row_with_alt(
     coord_offsets: &[isize],
     num_coords: usize,

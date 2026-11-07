@@ -1,3 +1,4 @@
+mod gram;
 mod util;
 
 use std::ops::{Add, AddAssign};
@@ -7,10 +8,7 @@ use arrayvec::ArrayVec;
 use rayon::{prelude::*, scope};
 use v_frame::{chroma::ChromaSubsampling, frame::Frame, plane::Plane};
 
-use self::util::{
-    DiffPlane, extract_ar_row, extract_ar_row_with_alt, get_block_mean, get_noise_var, linsolve,
-    multiply_mat,
-};
+use self::util::{DiffPlane, get_block_mean, get_noise_var, linsolve, multiply_mat};
 use super::{BLOCK_SIZE, BLOCK_SIZE_SQUARED, NoiseStatus};
 use crate::{
     DEFAULT_GRAIN_SEED, GrainTableSegment, NUM_UV_COEFFS, NUM_UV_POINTS, NUM_Y_COEFFS,
@@ -344,12 +342,14 @@ fn to_coeff(value: f64) -> i8 {
 
 /// Subtract the block's diff plane from each neighbour: its value `p` at the current pixel plus
 /// the plane's rise to that neighbour.
+#[cfg(test)]
 fn remove_plane(values: &mut [f64], p: f64, taps: &[f64]) {
     for (value, tap) in values.iter_mut().zip(taps) {
         *value -= p + tap;
     }
 }
 
+#[cfg(test)]
 fn add_ar_observation(eqns: &mut EquationSystem, buffer: &[f64], val: f64) {
     match eqns.n {
         NUM_Y_COEFFS => add_ar_observation_n::<NUM_Y_COEFFS>(eqns, buffer, val),
@@ -358,6 +358,7 @@ fn add_ar_observation(eqns: &mut EquationSystem, buffer: &[f64], val: f64) {
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn add_ar_observation_n<const N: usize>(eqns: &mut EquationSystem, buffer: &[f64], val: f64) {
     debug_assert_eq!(eqns.n, N);
@@ -1014,10 +1015,6 @@ impl NoiseModel {
         let alt_denoised_origin =
             alt_denoised.map(|s| get_dbg(s.data(), s.geometry().data_origin()..));
         let alt_origins = alt_source_origin.zip(alt_denoised_origin);
-        let mut coord_offsets = [0isize; NUM_Y_COEFFS];
-        for (offset, coord) in coord_offsets.iter_mut().zip(coords.iter()).take(num_coords) {
-            *offset = coord[1] * stride as isize + coord[0];
-        }
         const BLOCKS_PER_CHUNK: usize = 8;
         let observations = flat_block_indices
             .par_chunks(BLOCKS_PER_CHUNK)
@@ -1025,12 +1022,10 @@ impl NoiseModel {
                 let mut chunk_eqns = EquationSystem::new(n);
                 let mut chunk_observations = 0usize;
                 let mut eqns = EquationSystem::new(n);
-                let mut buffer = [0f64; NUM_UV_COEFFS];
+                let mut values = Vec::new();
 
                 for &block_index in chunk {
                     eqns.clear();
-                    let mut num_observations = 0usize;
-                    let mut residual_energy = 0f64;
                     let by = block_index / num_blocks_w;
                     let bx = block_index % num_blocks_w;
                     let flat_block_index = by * num_blocks_w + bx;
@@ -1052,11 +1047,6 @@ impl NoiseModel {
                             BLOCK_SIZE,
                         )
                     });
-                    let mut taps = [0f64; NUM_Y_COEFFS];
-                    for (tap, coord) in taps.iter_mut().zip(coords.iter()).take(num_coords) {
-                        *tap = plane.step(coord[0], coord[1]);
-                    }
-                    let taps = get_dbg(&taps, ..num_coords);
                     let y_start = if by > 0 && flat_blocks[flat_block_index - num_blocks_w] > 0 {
                         0
                     } else {
@@ -1075,62 +1065,35 @@ impl NoiseModel {
                             block_w - NOISE_MODEL_LAG
                         },
                     );
-
-                    if let Some((alt_source_origin, alt_denoised_origin)) = alt_origins {
-                        for y in y_start..y_end {
-                            let row_index = (y + y_o) * stride + x_o;
-                            for x in x_start..x_end {
-                                let base_index = row_index + x;
-                                let val = extract_ar_row_with_alt(
-                                    &coord_offsets,
-                                    num_coords,
-                                    source_origin,
-                                    denoised_origin,
-                                    base_index,
-                                    dec,
-                                    alt_source_origin,
-                                    alt_denoised_origin,
-                                    alt_stride,
-                                    x + x_o,
-                                    y + y_o,
-                                    &mut buffer,
-                                );
-                                let p = plane.at((x + x_o) as f64, (y + y_o) as f64);
-                                remove_plane(get_dbg_mut(&mut buffer, ..num_coords), p, taps);
-                                // The luma term averages the co-located luma pixels.
-                                let half_x = 0.5f64 * dec.0 as f64;
-                                let half_y = 0.5f64 * dec.1 as f64;
-                                *get_dbg_mut(&mut buffer, num_coords) -=
-                                    alt_plane.unwrap_or_default().at(
-                                        ((x + x_o) << dec.0) as f64 + half_x,
-                                        ((y + y_o) << dec.1) as f64 + half_y,
-                                    );
-                                add_ar_observation(&mut eqns, &buffer, val - p);
-                                residual_energy += (val - p) * (val - p);
-                                num_observations += 1;
-                            }
-                        }
-                    } else {
-                        for y in y_start..y_end {
-                            let row_index = (y + y_o) * stride + x_o;
-                            for x in x_start..x_end {
-                                let base_index = row_index + x;
-                                let val = extract_ar_row(
-                                    &coord_offsets,
-                                    num_coords,
-                                    source_origin,
-                                    denoised_origin,
-                                    base_index,
-                                    &mut buffer,
-                                );
-                                let p = plane.at((x + x_o) as f64, (y + y_o) as f64);
-                                remove_plane(get_dbg_mut(&mut buffer, ..num_coords), p, taps);
-                                add_ar_observation(&mut eqns, &buffer, val - p);
-                                residual_energy += (val - p) * (val - p);
-                                num_observations += 1;
-                            }
-                        }
-                    }
+                    let alt =
+                        alt_origins
+                            .zip(alt_plane)
+                            .map(|((alt_source, alt_denoised), plane)| gram::Alt {
+                                source: alt_source,
+                                denoised: alt_denoised,
+                                stride: alt_stride,
+                                dec,
+                                plane,
+                            });
+                    let (num_observations, residual_energy) = gram::block_equations(
+                        source_origin,
+                        denoised_origin,
+                        stride,
+                        (x_o, y_o),
+                        &gram::Window {
+                            x0: x_start,
+                            x1: x_end,
+                            y0: y_start,
+                            y1: y_end,
+                        },
+                        get_dbg(coords, ..num_coords),
+                        &plane,
+                        alt.as_ref(),
+                        n,
+                        &mut eqns.a,
+                        &mut eqns.b,
+                        &mut values,
+                    );
                     if num_observations > 0 {
                         // Fitting the plane to the block's own pixels anti-correlates what is
                         // left by about 3 var / samples for every pixel pair; add that back.
@@ -1639,7 +1602,199 @@ impl AddAssign<&StrengthSolver> for StrengthSolver {
 
 #[cfg(test)]
 mod tests {
+    use v_frame::frame::FrameBuilder;
+
+    use super::util::{extract_ar_row, extract_ar_row_with_alt};
+
     use super::*;
+
+    /// The block equations as the old per-pixel loop built them.
+    #[allow(clippy::indexing_slicing, reason = "test reference")]
+    #[allow(clippy::too_many_arguments)]
+    fn per_pixel_equations(
+        coords: &[[isize; 2]],
+        source: &Plane<u8>,
+        denoised: &Plane<u8>,
+        alt: Option<(&Plane<u8>, &Plane<u8>)>,
+        (x_o, y_o): (usize, usize),
+        win: &gram::Window,
+        plane: &DiffPlane,
+        alt_plane: Option<&DiffPlane>,
+        eqns: &mut EquationSystem,
+    ) -> f64 {
+        let dec = (
+            usize::from(source.geometry().subsampling_x()) >> 1,
+            usize::from(source.geometry().subsampling_y()) >> 1,
+        );
+        let stride = source.geometry().stride();
+        let origin = |p: &Plane<u8>| p.data()[p.geometry().data_origin()..].to_vec();
+        let (so, dno) = (origin(source), origin(denoised));
+        let offsets = coords
+            .iter()
+            .map(|c| c[1] * stride as isize + c[0])
+            .collect::<Vec<_>>();
+        let taps = coords
+            .iter()
+            .map(|c| plane.step(c[0], c[1]))
+            .collect::<Vec<_>>();
+        let mut buffer = [0f64; NUM_UV_COEFFS];
+        let mut residual = 0f64;
+        for y in win.y0..win.y1 {
+            for x in win.x0..win.x1 {
+                let base = (y + y_o) * stride + x_o + x;
+                let val = match alt {
+                    Some((s, d)) => extract_ar_row_with_alt(
+                        &offsets,
+                        coords.len(),
+                        &so,
+                        &dno,
+                        base,
+                        dec,
+                        &origin(s),
+                        &origin(d),
+                        s.geometry().stride(),
+                        x + x_o,
+                        y + y_o,
+                        &mut buffer,
+                    ),
+                    None => extract_ar_row(&offsets, coords.len(), &so, &dno, base, &mut buffer),
+                };
+                let p = plane.at((x + x_o) as f64, (y + y_o) as f64);
+                remove_plane(&mut buffer[..coords.len()], p, &taps);
+                if let Some(alt_plane) = alt_plane {
+                    buffer[coords.len()] -= alt_plane.at(
+                        ((x + x_o) << dec.0) as f64 + 0.5 * dec.0 as f64,
+                        ((y + y_o) << dec.1) as f64 + 0.5 * dec.1 as f64,
+                    );
+                }
+                add_ar_observation(eqns, &buffer, val - p);
+                residual += (val - p) * (val - p);
+            }
+        }
+        residual
+    }
+
+    #[test]
+    #[allow(clippy::indexing_slicing, reason = "test")]
+    fn integer_block_equations_match_the_per_pixel_fit() {
+        let (w, h) = (192usize, 128usize);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut noise = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            ((seed >> 11) as f64 / (1u64 << 53) as f64 - 0.5) * 20.0
+        };
+        let mut fill = |pw: usize, ph: usize, offset: f64| {
+            let clean = (0..pw * ph)
+                .map(|i| 90.0 + (i % pw) as f64 * 0.3 + (i / pw) as f64 * 0.2)
+                .collect::<Vec<_>>();
+            // A denoiser-style offset and slope on top of the grain.
+            let noisy = clean
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let drift = offset + 0.02 * (i % pw) as f64 - 0.03 * (i / pw) as f64;
+                    (c + drift + noise()).round().clamp(0.0, 255.0) as u8
+                })
+                .collect::<Vec<_>>();
+            let clean = clean.iter().map(|c| c.round() as u8).collect::<Vec<_>>();
+            (noisy, clean)
+        };
+        let mut src = FrameBuilder::new(w, h, ChromaSubsampling::Yuv420, 8)
+            .build()
+            .expect("4:2:0 frame builds");
+        let mut den = src.clone();
+        let (ys, yd) = fill(w, h, 2.5);
+        let (us, ud) = fill(w / 2, h / 2, -1.5);
+        src.y_plane.copy_from_slice(&ys).expect("luma fits");
+        den.y_plane.copy_from_slice(&yd).expect("luma fits");
+        let cb = |f: &mut Frame<u8>, data: &[u8]| {
+            f.u_plane
+                .as_mut()
+                .expect("4:2:0 has Cb")
+                .copy_from_slice(data)
+                .expect("Cb fits");
+        };
+        cb(&mut src, &us);
+        cb(&mut den, &ud);
+
+        let coords = NoiseModel::new().coords;
+        let lag = NOISE_MODEL_LAG;
+        let origin = |p: &Plane<u8>| p.data()[p.geometry().data_origin()..].to_vec();
+        let (ys_o, yd_o) = (origin(&src.y_plane), origin(&den.y_plane));
+        let mut values = Vec::new();
+        for (bx, by) in [(1usize, 1usize), (2, 2), (4, 2)] {
+            for chroma in [false, true] {
+                let (s, d, bw, dims) = if chroma {
+                    let s = src.u_plane.as_ref().expect("4:2:0 has Cb");
+                    let d = den.u_plane.as_ref().expect("4:2:0 has Cb");
+                    (s, d, BLOCK_SIZE / 2, (w / 2, h / 2))
+                } else {
+                    (&src.y_plane, &den.y_plane, BLOCK_SIZE, (w, h))
+                };
+                // Interior block, block with flat neighbours, and with a flat block above only.
+                for (x0, y0, x1) in [(lag, lag, bw - lag), (0, 0, bw), (lag, 0, bw - lag)] {
+                    let win = gram::Window { x0, x1, y0, y1: bw };
+                    let (x_o, y_o) = (bx * bw, by * bw);
+                    let plane = DiffPlane::fit(s, d, dims, x_o, y_o, bw, bw);
+                    let alt_plane = chroma.then(|| {
+                        let (lx, ly) = (x_o * 2, y_o * 2);
+                        DiffPlane::fit(&src.y_plane, &den.y_plane, (w, h), lx, ly, 32, 32)
+                    });
+                    let n = coords.len() + usize::from(chroma);
+                    let mut want = EquationSystem::new(n);
+                    let want_residual = per_pixel_equations(
+                        &coords,
+                        s,
+                        d,
+                        chroma.then_some((&src.y_plane, &den.y_plane)),
+                        (x_o, y_o),
+                        &win,
+                        &plane,
+                        alt_plane.as_ref(),
+                        &mut want,
+                    );
+                    let alt = alt_plane.map(|plane| gram::Alt {
+                        source: &ys_o,
+                        denoised: &yd_o,
+                        stride: src.y_plane.geometry().stride(),
+                        dec: (1, 1),
+                        plane,
+                    });
+                    let mut got = EquationSystem::new(n);
+                    let (count, got_residual) = gram::block_equations(
+                        &origin(s),
+                        &origin(d),
+                        s.geometry().stride(),
+                        (x_o, y_o),
+                        &win,
+                        &coords,
+                        &plane,
+                        alt.as_ref(),
+                        n,
+                        &mut got.a,
+                        &mut got.b,
+                        &mut values,
+                    );
+                    assert_eq!(count, (x1 - x0) * (bw - y0));
+                    let close = |a: f64, b: f64| (a - b).abs() <= 1e-6 * (1.0 + b.abs());
+                    for i in 0..n {
+                        for j in i..n {
+                            let (g, e) = (got.a[i * n + j], want.a[i * n + j]);
+                            assert!(close(g, e), "a[{i}][{j}] {g} != {e}, chroma {chroma}");
+                        }
+                        let (g, e) = (got.b[i], want.b[i]);
+                        assert!(close(g, e), "b[{i}] {g} != {e}, chroma {chroma}");
+                    }
+                    assert!(
+                        close(got_residual, want_residual),
+                        "residual, chroma {chroma}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn sparse_bright_bins_hold_the_mid_tone_strength() {
