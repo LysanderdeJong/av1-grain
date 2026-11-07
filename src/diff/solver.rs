@@ -471,6 +471,22 @@ impl NoiseModel {
         }
 
         let frame_dims = (source.y_plane.width(), source.y_plane.height());
+        // Luma uses these planes for its own fit and chroma for its luma input.
+        let luma_planes = flat_block_indices
+            .par_iter()
+            .map(|&index| {
+                let (bx, by) = (index % num_blocks_w, index / num_blocks_w);
+                DiffPlane::fit(
+                    &source.y_plane,
+                    &denoised.y_plane,
+                    frame_dims,
+                    bx * BLOCK_SIZE,
+                    by * BLOCK_SIZE,
+                    BLOCK_SIZE,
+                    BLOCK_SIZE,
+                )
+            })
+            .collect::<Vec<_>>();
         if let Err(err) = profile::time(MetricId::UpdateLatestY, || {
             Self::update_latest_channel(
                 0,
@@ -484,6 +500,7 @@ impl NoiseModel {
                 frame_dims,
                 flat_blocks,
                 &flat_block_indices,
+                &luma_planes,
                 num_blocks_w,
                 num_blocks_h,
                 0f64,
@@ -530,6 +547,7 @@ impl NoiseModel {
                     frame_dims,
                     flat_blocks,
                     &flat_block_indices,
+                    &luma_planes,
                     num_blocks_w,
                     num_blocks_h,
                     luma_gain,
@@ -549,6 +567,7 @@ impl NoiseModel {
                     frame_dims,
                     flat_blocks,
                     &flat_block_indices,
+                    &luma_planes,
                     num_blocks_w,
                     num_blocks_h,
                     luma_gain,
@@ -915,6 +934,7 @@ impl NoiseModel {
         frame_dims: (usize, usize),
         flat_blocks: &[u8],
         flat_block_indices: &[usize],
+        luma_planes: &[DiffPlane],
         num_blocks_w: usize,
         num_blocks_h: usize,
         luma_gain: f64,
@@ -938,6 +958,7 @@ impl NoiseModel {
                 frame_dims,
                 flat_blocks,
                 flat_block_indices,
+                luma_planes,
                 num_blocks_w,
                 num_blocks_h,
             );
@@ -995,6 +1016,7 @@ impl NoiseModel {
         frame_dims: (usize, usize),
         flat_blocks: &[u8],
         flat_block_indices: &[usize],
+        luma_planes: &[DiffPlane],
         num_blocks_w: usize,
         _num_blocks_h: usize,
     ) {
@@ -1018,13 +1040,14 @@ impl NoiseModel {
         const BLOCKS_PER_CHUNK: usize = 8;
         let observations = flat_block_indices
             .par_chunks(BLOCKS_PER_CHUNK)
-            .map(|chunk| {
+            .zip(luma_planes.par_chunks(BLOCKS_PER_CHUNK))
+            .map(|(chunk, luma_planes)| {
                 let mut chunk_eqns = EquationSystem::new(n);
                 let mut chunk_observations = 0usize;
                 let mut eqns = EquationSystem::new(n);
                 let mut values = Vec::new();
 
-                for &block_index in chunk {
+                for (&block_index, &luma_plane) in chunk.iter().zip(luma_planes) {
                     eqns.clear();
                     let by = block_index / num_blocks_w;
                     let bx = block_index % num_blocks_w;
@@ -1034,19 +1057,14 @@ impl NoiseModel {
                     let x_o = bx * block_w;
                     // Fit the grain texture, not the denoiser's offset and gradient.
                     let plane_dims = (frame_dims.0 >> dec.0, frame_dims.1 >> dec.1);
-                    let plane =
-                        DiffPlane::fit(source, denoised, plane_dims, x_o, y_o, block_w, block_h);
-                    let alt_plane = alt_source.zip(alt_denoised).map(|(s, d)| {
-                        DiffPlane::fit(
-                            s,
-                            d,
-                            frame_dims,
-                            x_o << dec.0,
-                            y_o << dec.1,
-                            BLOCK_SIZE,
-                            BLOCK_SIZE,
-                        )
-                    });
+                    let (plane, alt_plane) = if alt_source.is_some() {
+                        let plane = DiffPlane::fit(
+                            source, denoised, plane_dims, x_o, y_o, block_w, block_h,
+                        );
+                        (plane, Some(luma_plane))
+                    } else {
+                        (luma_plane, None)
+                    };
                     let y_start = if by > 0 && flat_blocks[flat_block_index - num_blocks_w] > 0 {
                         0
                     } else {
