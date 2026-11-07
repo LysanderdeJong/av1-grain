@@ -97,8 +97,10 @@ fn convert_plane_to_u8<T: Pixel>(in_plane: &Plane<T>, out_plane: &mut Plane<u8>,
             let in_row = get_dbg(in_rows, in_visible_start..in_visible_start + width);
             let out_start = out_geometry.pad_left();
             let out_row = get_dbg_mut(out_row, out_start..out_start + width);
+            // Round, don't truncate: truncation shifts every sample down by half a step.
+            let half = (1u32 << shift) >> 1;
             for (i, o) in in_row.iter().zip(out_row.iter_mut()) {
-                *o = (*i >> shift) as u8;
+                *o = ((u32::from(*i) + half) >> shift).min(255) as u8;
             }
         });
 }
@@ -181,7 +183,7 @@ mod tests {
             let input = frame.plane(plane_index).expect("plane exists");
             let output = converted.plane(plane_index).expect("plane exists");
             for (i, o) in input.pixels().zip(output.pixels()) {
-                assert_eq!((i >> 2) as u8, o);
+                assert_eq!(((i + 2) >> 2).min(255) as u8, o);
             }
         }
     }

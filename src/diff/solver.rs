@@ -8,7 +8,8 @@ use rayon::{prelude::*, scope};
 use v_frame::{chroma::ChromaSubsampling, frame::Frame, plane::Plane};
 
 use self::util::{
-    extract_ar_row, extract_ar_row_with_alt, get_block_mean, get_noise_var, linsolve, multiply_mat,
+    DiffPlane, extract_ar_row, extract_ar_row_with_alt, get_block_mean, get_noise_var, linsolve,
+    multiply_mat,
 };
 use super::{BLOCK_SIZE, BLOCK_SIZE_SQUARED, NoiseStatus};
 use crate::{
@@ -22,6 +23,10 @@ use crate::{
 const LOW_POLY_NUM_PARAMS: usize = 3;
 const NOISE_MODEL_LAG: usize = 3;
 const BLOCK_NORMALIZATION: f64 = 255.0f64;
+/// Minimum colour grain strength (8-bit std) worth synthesising.
+const CHROMA_FLOOR: f64 = 0.5f64;
+/// Minimum colour grain strength relative to luma.
+const CHROMA_SHARE_OF_LUMA: f64 = 0.15f64;
 const INV_BLOCK_NORMALIZATION_SQUARED: f64 = 1.0f64 / (BLOCK_NORMALIZATION * BLOCK_NORMALIZATION);
 
 #[derive(Debug, Clone)]
@@ -83,28 +88,19 @@ impl FlatBlockFinder {
     // in extreme cases.
     #[must_use]
     #[allow(clippy::too_many_lines)]
-    pub fn run(&self, plane: &Plane<u8>) -> (Vec<u8>, usize) {
+    /// Marks blocks whose content is flat. The gradient features come from the denoised
+    /// plane, so grain doesn't hide flat content and denoiser halos at edges are rejected; the
+    /// variance check uses the source, to skip clipped areas that carry no grain.
+    pub fn run(&self, plane: &Plane<u8>, denoised: &Plane<u8>) -> (Vec<u8>, usize) {
         const TRACE_THRESHOLD: f64 = 0.15f64 / BLOCK_SIZE_SQUARED as f64;
-        const RATIO_THRESHOLD: f64 = 1.25f64;
         const NORM_THRESHOLD: f64 = 0.08f64 / BLOCK_SIZE_SQUARED as f64;
-        const VAR_THRESHOLD: f64 = 0.005f64 / BLOCK_SIZE_SQUARED as f64;
-
-        // The following weights are used to combine the above features to give
-        // a sigmoid score for flatness. If the input was normalized to [0,100]
-        // the magnitude of these values would be close to 1 (e.g., weights
-        // corresponding to variance would be a factor of 10000x smaller).
-        const VAR_WEIGHT: f64 = -6682f64;
-        const RATIO_WEIGHT: f64 = -0.2056f64;
-        const TRACE_WEIGHT: f64 = 13087f64;
-        const NORM_WEIGHT: f64 = -12434f64;
-        const OFFSET: f64 = 2.5694f64;
+        // A grain std of 0.3 (8-bit): below this the block is clipped or carries no grain.
+        const VAR_THRESHOLD: f64 = (0.3 / BLOCK_NORMALIZATION) * (0.3 / BLOCK_NORMALIZATION);
 
         let num_blocks_w = plane.width().div_ceil(BLOCK_SIZE);
         let num_blocks_h = plane.height().div_ceil(BLOCK_SIZE);
         let num_blocks = num_blocks_w * num_blocks_h;
-        let mut flat_blocks = vec![0u8; num_blocks];
-        let mut num_flat = 0;
-        let mut scores = (0..num_blocks)
+        let flat_blocks = (0..num_blocks)
             .into_par_iter()
             .map(|index| {
                 let by = index / num_blocks_w;
@@ -118,6 +114,7 @@ impl FlatBlockFinder {
                 let mut gyy = 0f64;
                 let mut var = 0f64;
                 let mut mean = 0f64;
+                let mut denoised_result = [0.0f64; BLOCK_SIZE_SQUARED];
 
                 self.extract_block(
                     plane,
@@ -126,11 +123,18 @@ impl FlatBlockFinder {
                     &mut plane_result,
                     &mut block_result,
                 );
+                self.extract_block(
+                    denoised,
+                    bx * BLOCK_SIZE,
+                    by * BLOCK_SIZE,
+                    &mut plane_result,
+                    &mut denoised_result,
+                );
                 for yi in 1..(BLOCK_SIZE - 1) {
                     for xi in 1..(BLOCK_SIZE - 1) {
                         // SAFETY: We know the size of `block_result` and that we cannot exceed the bounds of it
                         unsafe {
-                            let result_ptr = block_result.as_ptr().add(yi * BLOCK_SIZE + xi);
+                            let result_ptr = denoised_result.as_ptr().add(yi * BLOCK_SIZE + xi);
 
                             let gx = (*result_ptr.add(1) - *result_ptr.sub(1)) / 2f64;
                             let gy =
@@ -139,7 +143,7 @@ impl FlatBlockFinder {
                             gxy += gx * gy;
                             gyy += gy * gy;
 
-                            let block_val = *result_ptr;
+                            let block_val = *block_result.as_ptr().add(yi * BLOCK_SIZE + xi);
                             mean += block_val;
                             var += block_val * block_val;
                         }
@@ -157,62 +161,16 @@ impl FlatBlockFinder {
                 let trace = gxx + gyy;
                 let det = gxx.mul_add(gyy, -gxy.powi(2));
                 let e_sub = (trace.mul_add(trace, -4f64 * det)).max(0.).sqrt();
-                let e1 = f64::midpoint(trace, e_sub);
-                let e2 = (trace - e_sub) / 2.0f64;
-                // Spectral norm
-                let norm = e1;
-                let ratio = e1 / e2.max(1.0e-6_f64);
-                let is_flat = trace < TRACE_THRESHOLD
-                    && ratio < RATIO_THRESHOLD
-                    && norm < NORM_THRESHOLD
-                    && var > VAR_THRESHOLD;
+                // Spectral norm. libaom also tests the eigenvalue ratio, which tells grain from
+                // structure on a noisy plane; on the clean denoised plane the norm catches edges.
+                let norm = f64::midpoint(trace, e_sub);
+                let is_flat =
+                    trace < TRACE_THRESHOLD && norm < NORM_THRESHOLD && var > VAR_THRESHOLD;
 
-                let sum_weights = NORM_WEIGHT.mul_add(
-                    norm,
-                    TRACE_WEIGHT.mul_add(
-                        trace,
-                        VAR_WEIGHT.mul_add(var, RATIO_WEIGHT.mul_add(ratio, OFFSET)),
-                    ),
-                );
-                // clamp the value to [-25.0, 100.0] to prevent overflow
-                let sum_weights = sum_weights.clamp(-25.0f64, 100.0f64);
-                let score = (1.0f64 / (1.0f64 + (-sum_weights).exp())) as f32;
-
-                (
-                    index,
-                    if is_flat { 255 } else { 0 },
-                    IndexAndScore {
-                        score: if var > VAR_THRESHOLD { score } else { 0f32 },
-                        index,
-                    },
-                )
+                if is_flat { 255u8 } else { 0 }
             })
             .collect::<Vec<_>>();
-
-        for (index, flat_block, _) in &scores {
-            *get_dbg_mut(&mut flat_blocks, *index) = *flat_block;
-            if *flat_block != 0 {
-                num_flat += 1;
-            }
-        }
-        let mut scores = scores
-            .drain(..)
-            .map(|(_, _, score)| score)
-            .collect::<Vec<_>>();
-
-        scores.sort_unstable_by(|a, b| a.score.partial_cmp(&b.score).expect("Shouldn't be NaN"));
-
-        let top_nth_percentile = num_blocks * 90 / 100;
-        let score_threshold = unsafe { scores.get_unchecked(top_nth_percentile) }.score;
-        for score in &scores {
-            if score.score >= score_threshold {
-                let block_ref = unsafe { flat_blocks.get_unchecked_mut(score.index) };
-                if *block_ref == 0 {
-                    num_flat += 1;
-                }
-                *block_ref |= 1;
-            }
-        }
+        let num_flat = flat_blocks.iter().filter(|&&block| block != 0).count();
 
         (flat_blocks, num_flat)
     }
@@ -281,12 +239,6 @@ impl FlatBlockFinder {
             *block_res -= *plane_res;
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct IndexAndScore {
-    pub index: usize,
-    pub score: f32,
 }
 
 /// Wrapper of data required to represent linear system of eqns and soln.
@@ -382,6 +334,22 @@ fn scale_equation_system(eqns: &mut EquationSystem, scale: f64) {
     }
 }
 
+fn to_coeff(value: f64) -> i8 {
+    let rounded = value.round() as i32;
+    if !(-128..=127).contains(&rounded) {
+        log::warn!("AR coefficient {value:.1} clamped to the i8 range");
+    }
+    rounded.clamp(-128, 127) as i8
+}
+
+/// Subtract the block's diff plane from each neighbour: its value `p` at the current pixel plus
+/// the plane's rise to that neighbour.
+fn remove_plane(values: &mut [f64], p: f64, taps: &[f64]) {
+    for (value, tap) in values.iter_mut().zip(taps) {
+        *value -= p + tap;
+    }
+}
+
 fn add_ar_observation(eqns: &mut EquationSystem, buffer: &[f64], val: f64) {
     match eqns.n {
         NUM_Y_COEFFS => add_ar_observation_n::<NUM_Y_COEFFS>(eqns, buffer, val),
@@ -472,6 +440,7 @@ impl NoiseModel {
         source: &Frame<u8>,
         denoised: &Frame<u8>,
         flat_blocks: &[u8],
+        allow_split: bool,
     ) -> NoiseStatus {
         let num_blocks_w = source.y_plane.width().div_ceil(BLOCK_SIZE);
         let num_blocks_h = source.y_plane.height().div_ceil(BLOCK_SIZE);
@@ -491,8 +460,13 @@ impl NoiseModel {
             .enumerate()
             .filter_map(|(index, block)| (*block > 0).then_some(index))
             .collect::<Vec<_>>();
-        if flat_block_indices.len() <= 1 {
-            return NoiseStatus::Error(anyhow!("Not enough flat blocks to update noise estimate"));
+        // ponytail: fixed 1% share; tune per resolution if small frames starve.
+        let min_flat_blocks = (flat_blocks.len() / 100).max(2);
+        if flat_block_indices.len() < min_flat_blocks {
+            return NoiseStatus::Error(anyhow!(
+                "{} flat blocks, need {min_flat_blocks} to update noise estimate",
+                flat_block_indices.len()
+            ));
         }
 
         let frame_dims = (source.y_plane.width(), source.y_plane.height());
@@ -592,7 +566,10 @@ impl NoiseModel {
                 // Check noise characteristics and return if error
                 let is_different = self.is_different();
                 let combined_state = get_dbg_mut(&mut self.combined_state, channel);
-                if channel == 0 && combined_state.strength_solver.num_equations > 0 && is_different
+                if allow_split
+                    && channel == 0
+                    && combined_state.strength_solver.num_equations > 0
+                    && is_different
                 {
                     y_model_different = true;
                 }
@@ -674,8 +651,22 @@ impl NoiseModel {
             });
         });
         let scaling_points_y = scaling_points_y.expect("scope task should set luma scaling points");
-        let scaling_points_cb = scaling_points_cb.expect("scope task should set Cb scaling points");
-        let scaling_points_cr = scaling_points_cr.expect("scope task should set Cr scaling points");
+        let mut scaling_points_cb =
+            scaling_points_cb.expect("scope task should set Cb scaling points");
+        let mut scaling_points_cr =
+            scaling_points_cr.expect("scope task should set Cr scaling points");
+        // Colour grain only when clearly present: a denoiser's colour changes otherwise
+        // become coloured specks.
+        let luma_strength = self.combined_state[0].strength_solver.average_strength();
+        let chroma_floor = CHROMA_FLOOR.max(CHROMA_SHARE_OF_LUMA * luma_strength);
+        for (points, state) in [
+            (&mut scaling_points_cb, &self.combined_state[1]),
+            (&mut scaling_points_cr, &self.combined_state[2]),
+        ] {
+            if state.strength_solver.average_strength() < chroma_floor {
+                points.clear();
+            }
+        }
 
         let mut max_scaling_value: f64 = 1.0e-4f64;
         for p in scaling_points_y
@@ -734,23 +725,7 @@ impl NoiseModel {
             // Since the correlation between luma/chroma was computed in an already
             // scaled space, we adjust it in the un-scaled space.
             let solver = &unsafe { self.combined_state.get_unchecked(c) }.strength_solver;
-            // Compute a weighted average of the strength for the channel.
-            let mut average_strength = 0f64;
-            let mut total_weight = 0f64;
-            for i in 0..solver.eqns.n {
-                let mut w = 0f64;
-                for j in 0..solver.eqns.n {
-                    w += *unsafe { solver.eqns.a.get_unchecked(i * solver.eqns.n + j) };
-                }
-                w = w.sqrt();
-                average_strength += *unsafe { solver.eqns.x.get_unchecked(i) } * w;
-                total_weight += w;
-            }
-            if total_weight.abs() < f64::EPSILON {
-                average_strength = 1f64;
-            } else {
-                average_strength /= total_weight;
-            }
+            let average_strength = solver.average_strength_or_one();
             if c == 0 {
                 avg_luma_strength = average_strength;
             } else {
@@ -799,6 +774,22 @@ impl NoiseModel {
         }
     }
 
+    /// Forget everything, so the next frame starts a fresh estimate.
+    pub fn reset(&mut self) {
+        for state in &mut self.combined_state {
+            state.eqns.clear();
+            state.strength_solver.clear();
+            state.num_observations = 0;
+            state.ar_gain = 1.0f64;
+        }
+    }
+
+    /// Whether any frame since the last reset contributed to the luma estimate.
+    #[must_use]
+    pub const fn has_estimate(&self) -> bool {
+        self.combined_state[0].strength_solver.num_equations > 0
+    }
+
     pub fn save_latest(&mut self) {
         for c in 0..3 {
             let latest_state = unsafe { self.latest_state.get_unchecked(c) };
@@ -810,6 +801,11 @@ impl NoiseModel {
                 .copy_from(&latest_state.strength_solver.eqns);
             combined_state.strength_solver.num_equations =
                 latest_state.strength_solver.num_equations;
+            combined_state.strength_solver.total = latest_state.strength_solver.total;
+            combined_state
+                .strength_solver
+                .bin_weight
+                .clone_from(&latest_state.strength_solver.bin_weight);
             combined_state.num_observations = latest_state.num_observations;
             combined_state.ar_gain = latest_state.ar_gain;
         }
@@ -828,7 +824,7 @@ impl NoiseModel {
         let eqns = &self.combined_state[0].eqns;
         for i in 0..n_coeff {
             let xi = *unsafe { eqns.x.get_unchecked(i) };
-            coeffs.push(((scale_ar_coeff * xi).round() as i32).clamp(-128i32, 127i32) as i8);
+            coeffs.push(to_coeff(scale_ar_coeff * xi));
         }
         coeffs
     }
@@ -846,12 +842,11 @@ impl NoiseModel {
         let eqns = &unsafe { self.combined_state.get_unchecked(channel) }.eqns;
         for i in 0..n_coeff {
             let xi = *unsafe { eqns.x.get_unchecked(i) };
-            coeffs.push(((scale_ar_coeff * xi).round() as i32).clamp(-128i32, 127i32) as i8);
+            coeffs.push(to_coeff(scale_ar_coeff * xi));
         }
-        coeffs.push(
-            ((scale_ar_coeff * *unsafe { y_corr.get_unchecked(channel - 1) }).round() as i32)
-                .clamp(-128i32, 127i32) as i8,
-        );
+        coeffs.push(to_coeff(
+            scale_ar_coeff * *unsafe { y_corr.get_unchecked(channel - 1) },
+        ));
         coeffs
     }
 
@@ -862,19 +857,32 @@ impl NoiseModel {
     #[must_use]
     fn is_different(&self) -> bool {
         const COEFF_THRESHOLD: f64 = 0.9f64;
-        const STRENGTH_THRESHOLD: f64 = 0.005f64;
+        // Mean strength change relative to the current strength.
+        const STRENGTH_THRESHOLD: f64 = 0.15f64;
 
         let latest = &self.latest_state[0];
         let combined = &self.combined_state[0];
+        // Near-white grain has near-zero coefficients whose correlation is just estimation
+        // noise, so the shapes must also differ by a real amount.
+        const COEFF_DISTANCE: f64 = 0.15f64;
         let corr = normalized_cross_correlation(&latest.eqns.x, &combined.eqns.x, combined.eqns.n);
-        if corr < COEFF_THRESHOLD {
+        let distance = latest
+            .eqns
+            .x
+            .iter()
+            .zip(&combined.eqns.x)
+            .take(combined.eqns.n)
+            .map(|(l, c)| (l - c) * (l - c))
+            .sum::<f64>()
+            .sqrt();
+        if corr < COEFF_THRESHOLD && distance > COEFF_DISTANCE {
             return true;
         }
 
-        let dx = 1.0f64 / latest.strength_solver.num_bins as f64;
         let latest_eqns = &latest.strength_solver.eqns;
         let combined_eqns = &combined.strength_solver.eqns;
         let mut diff = 0.0f64;
+        let mut strength = 0.0f64;
         let mut total_weight = 0.0f64;
         for j in 0..latest_eqns.n {
             let mut weight = 0.0f64;
@@ -886,10 +894,11 @@ impl NoiseModel {
                 * (*unsafe { latest_eqns.x.get_unchecked(j) }
                     - *unsafe { combined_eqns.x.get_unchecked(j) })
                 .abs();
+            strength += weight * *unsafe { combined_eqns.x.get_unchecked(j) };
             total_weight += weight;
         }
 
-        diff * dx / total_weight > STRENGTH_THRESHOLD
+        diff > STRENGTH_THRESHOLD * strength.max(total_weight * 0.1)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1021,12 +1030,33 @@ impl NoiseModel {
                 for &block_index in chunk {
                     eqns.clear();
                     let mut num_observations = 0usize;
+                    let mut residual_energy = 0f64;
                     let by = block_index / num_blocks_w;
                     let bx = block_index % num_blocks_w;
                     let flat_block_index = by * num_blocks_w + bx;
 
                     let y_o = by * block_h;
                     let x_o = bx * block_w;
+                    // Fit the grain texture, not the denoiser's offset and gradient.
+                    let plane_dims = (frame_dims.0 >> dec.0, frame_dims.1 >> dec.1);
+                    let plane =
+                        DiffPlane::fit(source, denoised, plane_dims, x_o, y_o, block_w, block_h);
+                    let alt_plane = alt_source.zip(alt_denoised).map(|(s, d)| {
+                        DiffPlane::fit(
+                            s,
+                            d,
+                            frame_dims,
+                            x_o << dec.0,
+                            y_o << dec.1,
+                            BLOCK_SIZE,
+                            BLOCK_SIZE,
+                        )
+                    });
+                    let mut taps = [0f64; NUM_Y_COEFFS];
+                    for (tap, coord) in taps.iter_mut().zip(coords.iter()).take(num_coords) {
+                        *tap = plane.step(coord[0], coord[1]);
+                    }
+                    let taps = get_dbg(&taps, ..num_coords);
                     let y_start = if by > 0 && flat_blocks[flat_block_index - num_blocks_w] > 0 {
                         0
                     } else {
@@ -1065,7 +1095,18 @@ impl NoiseModel {
                                     y + y_o,
                                     &mut buffer,
                                 );
-                                add_ar_observation(&mut eqns, &buffer, val);
+                                let p = plane.at((x + x_o) as f64, (y + y_o) as f64);
+                                remove_plane(get_dbg_mut(&mut buffer, ..num_coords), p, taps);
+                                // The luma term averages the co-located luma pixels.
+                                let half_x = 0.5f64 * dec.0 as f64;
+                                let half_y = 0.5f64 * dec.1 as f64;
+                                *get_dbg_mut(&mut buffer, num_coords) -=
+                                    alt_plane.unwrap_or_default().at(
+                                        ((x + x_o) << dec.0) as f64 + half_x,
+                                        ((y + y_o) << dec.1) as f64 + half_y,
+                                    );
+                                add_ar_observation(&mut eqns, &buffer, val - p);
+                                residual_energy += (val - p) * (val - p);
                                 num_observations += 1;
                             }
                         }
@@ -1082,12 +1123,24 @@ impl NoiseModel {
                                     base_index,
                                     &mut buffer,
                                 );
-                                add_ar_observation(&mut eqns, &buffer, val);
+                                let p = plane.at((x + x_o) as f64, (y + y_o) as f64);
+                                remove_plane(get_dbg_mut(&mut buffer, ..num_coords), p, taps);
+                                add_ar_observation(&mut eqns, &buffer, val - p);
+                                residual_energy += (val - p) * (val - p);
                                 num_observations += 1;
                             }
                         }
                     }
                     if num_observations > 0 {
+                        // Fitting the plane to the block's own pixels anti-correlates what is
+                        // left by about 3 var / samples for every pixel pair; add that back.
+                        let bias = 3f64 * residual_energy / plane.samples as f64;
+                        for i in 0..num_coords {
+                            for j in i..num_coords {
+                                *get_dbg_mut(&mut eqns.a, i * n + j) += bias;
+                            }
+                            *get_dbg_mut(&mut eqns.b, i) += bias;
+                        }
                         scale_equation_system(&mut eqns, INV_BLOCK_NORMALIZATION_SQUARED);
                         mirror_upper_triangle(&mut eqns);
                         chunk_eqns += &eqns;
@@ -1227,10 +1280,34 @@ impl NoiseModelState {
     }
 
     pub fn ar_equation_system_solve(&mut self, is_chroma: bool) -> bool {
-        let ret = self.eqns.solve();
+        // A small ridge keeps near-singular systems solvable without visibly biasing the fit.
+        const RIDGE: f64 = 1.0e-3f64;
+        // The AR filter must stay clearly stable: a coefficient sum near 1 synthesises blotches.
+        const MAX_ABS_SUM: f64 = 0.95f64;
+
+        let n = self.eqns.n;
+        let n_ar = n - usize::from(is_chroma);
+        let mean_diag = (0..n_ar)
+            .map(|i| *get_dbg(&self.eqns.a, i * n + i))
+            .sum::<f64>()
+            / n_ar as f64;
+        let mut a = self.eqns.a.clone();
+        for i in 0..n_ar {
+            *get_dbg_mut(&mut a, i * n + i) += RIDGE * mean_diag;
+        }
+        let mut b = self.eqns.b.clone();
+        let ret = linsolve(n, &mut a, n, &mut b, &mut self.eqns.x);
         self.ar_gain = 1.0f64;
         if !ret {
             return ret;
+        }
+        let coeffs = get_dbg_mut(&mut self.eqns.x, ..n_ar);
+        let abs_sum: f64 = coeffs.iter().map(|x| x.abs()).sum();
+        if abs_sum >= MAX_ABS_SUM {
+            let scale = 0.99f64 * MAX_ABS_SUM / abs_sum;
+            for x in coeffs {
+                *x *= scale;
+            }
         }
 
         // Update the AR gain from the equation system as it will be used to fit
@@ -1277,6 +1354,8 @@ struct StrengthSolver {
     num_bins: usize,
     num_equations: usize,
     total: f64,
+    /// Measurement weight per bin; sparse bins don't get to set their own value.
+    bin_weight: Vec<f64>,
 }
 
 impl StrengthSolver {
@@ -1287,6 +1366,7 @@ impl StrengthSolver {
             num_bins,
             num_equations: 0usize,
             total: 0f64,
+            bin_weight: vec![0f64; num_bins],
         }
     }
 
@@ -1303,6 +1383,8 @@ impl StrengthSolver {
         *unsafe { eqns.a.get_unchecked_mut(bin_i0 * n + bin_i1) } += (1f64 - a) * a;
         *unsafe { eqns.b.get_unchecked_mut(bin_i0) } += (1f64 - a) * noise_std;
         *unsafe { eqns.b.get_unchecked_mut(bin_i1) } += a * noise_std;
+        *get_dbg_mut(&mut self.bin_weight, bin_i0) += 1f64 - a;
+        *get_dbg_mut(&mut self.bin_weight, bin_i1) += a;
         self.total += noise_std;
         self.num_equations += 1;
     }
@@ -1314,12 +1396,29 @@ impl StrengthSolver {
 
         // Do this in a non-destructive manner so it is not confusing to the caller
         let old_a = self.eqns.a.clone();
-        for i in 0..n {
-            let i_lo = i.saturating_sub(1);
-            let i_hi = (n - 1).min(i + 1);
-            *unsafe { self.eqns.a.get_unchecked_mut(i * n + i_lo) } -= alpha;
-            *unsafe { self.eqns.a.get_unchecked_mut(i * n + i) } += 2f64 * alpha;
-            *unsafe { self.eqns.a.get_unchecked_mut(i * n + i_hi) } -= alpha;
+        let old_b = self.eqns.b.clone();
+        // Sparse bins leave the data term: a handful of blocks (often edge halos in a bright
+        // window) would otherwise set the grain for a whole brightness range, and the
+        // smoothing below would spread it into the reliable bins.
+        let reliable = self.reliable_bins();
+        for (i, &is_reliable) in reliable.iter().enumerate() {
+            if !is_reliable {
+                for j in 0..n {
+                    *get_dbg_mut(&mut self.eqns.a, i * n + j) = 0f64;
+                    *get_dbg_mut(&mut self.eqns.a, j * n + i) = 0f64;
+                }
+                *get_dbg_mut(&mut self.eqns.b, i) = 0f64;
+            }
+        }
+        // Penalise curvature, not slope: a slope penalty pulls both ends of a sloped strength
+        // curve towards flat (libaom's choice; it overstated highlight grain by 30%).
+        const SECOND_DIFF: [f64; 3] = [1f64, -2f64, 1f64];
+        for k in 0..n.saturating_sub(2) {
+            for (di, &wi) in SECOND_DIFF.iter().enumerate() {
+                for (dj, &wj) in SECOND_DIFF.iter().enumerate() {
+                    *get_dbg_mut(&mut self.eqns.a, (k + di) * n + k + dj) += alpha * wi * wj;
+                }
+            }
         }
 
         // Small regularization to give average noise strength
@@ -1330,7 +1429,42 @@ impl StrengthSolver {
         }
         let result = self.eqns.solve();
         self.eqns.a = old_a;
+        self.eqns.b = old_b;
+        if result {
+            self.hold_sparse_bins(&reliable);
+        }
         result
+    }
+
+    /// Bins with enough measurements to set their own value.
+    fn reliable_bins(&self) -> Vec<bool> {
+        const MIN_BIN_WEIGHT: f64 = 2f64;
+        const MIN_BIN_SHARE: f64 = 0.01f64;
+        let total: f64 = self.bin_weight.iter().sum();
+        let min_weight = MIN_BIN_WEIGHT.max(MIN_BIN_SHARE * total);
+        self.bin_weight.iter().map(|&w| w >= min_weight).collect()
+    }
+
+    /// Sparse bins take their value from the reliable ones: held flat beyond the ends,
+    /// interpolated in between, never extrapolated along a slope.
+    fn hold_sparse_bins(&mut self, reliable: &[bool]) {
+        let reliable: Vec<usize> = (0..self.num_bins)
+            .filter(|&i| *get_dbg(reliable, i))
+            .collect();
+        let (Some(&first), Some(&last)) = (reliable.first(), reliable.last()) else {
+            return;
+        };
+        let x = &mut self.eqns.x;
+        let (first_value, last_value) = (*get_dbg(x, first), *get_dbg(x, last));
+        get_dbg_mut(x, ..first).fill(first_value);
+        get_dbg_mut(x, last + 1..).fill(last_value);
+        for (&lo, &hi) in reliable.iter().zip(reliable.iter().skip(1)) {
+            let (lo_value, hi_value) = (*get_dbg(x, lo), *get_dbg(x, hi));
+            for i in (lo + 1)..hi {
+                let t = (i - lo) as f64 / (hi - lo) as f64;
+                *get_dbg_mut(x, i) = lo_value.mul_add(1f64 - t, hi_value * t);
+            }
+        }
     }
 
     #[must_use]
@@ -1366,6 +1500,9 @@ impl StrengthSolver {
             }
 
             lut.points.remove(min_index);
+            // Keep residuals aligned with their points (libaom leaves them shifted by one, so
+            // a flat run's zero residual can delete the knee after it).
+            residual.remove(min_index);
             self.update_piecewise_linear_residual(
                 &lut,
                 &mut residual,
@@ -1375,6 +1512,36 @@ impl StrengthSolver {
         }
 
         lut
+    }
+
+    /// Strength averaged over the bins, weighted by their measurements; 0 without any.
+    #[must_use]
+    fn average_strength(&self) -> f64 {
+        let n = self.eqns.n;
+        let mut average_strength = 0f64;
+        let mut total_weight = 0f64;
+        for i in 0..n {
+            let w = get_dbg(&self.eqns.a, i * n..(i + 1) * n)
+                .iter()
+                .sum::<f64>()
+                .sqrt();
+            average_strength += *get_dbg(&self.eqns.x, i) * w;
+            total_weight += w;
+        }
+        if total_weight.abs() < f64::EPSILON {
+            0f64
+        } else {
+            average_strength / total_weight
+        }
+    }
+
+    #[must_use]
+    fn average_strength_or_one(&self) -> f64 {
+        if self.num_equations == 0 {
+            1f64
+        } else {
+            self.average_strength()
+        }
     }
 
     #[must_use]
@@ -1393,6 +1560,7 @@ impl StrengthSolver {
         self.eqns.clear();
         self.num_equations = 0;
         self.total = 0f64;
+        self.bin_weight.fill(0f64);
     }
 
     #[must_use]
@@ -1453,9 +1621,7 @@ impl Add<&StrengthSolver> for StrengthSolver {
 
     fn add(self, addend: &StrengthSolver) -> Self::Output {
         let mut dest = self;
-        dest.eqns += &addend.eqns;
-        dest.num_equations += addend.num_equations;
-        dest.total += addend.total;
+        dest += addend;
         dest
     }
 }
@@ -1465,5 +1631,46 @@ impl AddAssign<&StrengthSolver> for StrengthSolver {
         self.eqns += &rhs.eqns;
         self.num_equations += rhs.num_equations;
         self.total += rhs.total;
+        for (weight, rhs_weight) in self.bin_weight.iter_mut().zip(&rhs.bin_weight) {
+            *weight += *rhs_weight;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sparse_bright_bins_hold_the_mid_tone_strength() {
+        let mut solver = StrengthSolver::new(20);
+        for i in 0..400 {
+            solver.add_measurement(60.0 + f64::from(i % 80), 2.0);
+        }
+        // Three halo blocks in the highlights with a huge std.
+        for _ in 0..3 {
+            solver.add_measurement(235.0, 12.0);
+        }
+        assert!(solver.solve());
+        let mid = solver.get_value(100.0);
+        let high = solver.get_value(240.0);
+        assert!((mid - 2.0).abs() < 0.1, "mid {mid}");
+        assert!((high - mid).abs() < 0.1, "high {high} vs mid {mid}");
+    }
+
+    #[test]
+    fn near_unit_ar_fit_is_shrunk_to_a_stable_filter() {
+        let mut state = NoiseModelState::new(2);
+        // Two strongly correlated neighbours that predict the target almost exactly.
+        for i in 0..200 {
+            let v = f64::from(i % 7) - 3.0;
+            let buffer = [v, v];
+            add_ar_observation_n::<2>(&mut state.eqns, &buffer, v);
+            state.num_observations += 1;
+        }
+        mirror_upper_triangle(&mut state.eqns);
+        assert!(state.ar_equation_system_solve(false));
+        let abs_sum: f64 = state.eqns.x.iter().map(|x| x.abs()).sum();
+        assert!(abs_sum < 0.95, "sum {abs_sum}");
     }
 }
