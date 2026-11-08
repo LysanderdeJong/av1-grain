@@ -163,17 +163,20 @@ pub(super) fn block_equations(
 fn alt_input(alt: &Alt, (x_o, y_o): (usize, usize), win: &Window, values: &mut Vec<i16>) -> Input {
     let start = values.len();
     let (sx, sy) = (1usize << alt.dec.0, 1usize << alt.dec.1);
+    let w = win.x1 - win.x0;
     for y in win.y0..win.y1 {
-        for x in win.x0..win.x1 {
-            let mut sum = 0i16;
-            for dy in 0..sy {
-                let row = ((y_o + y) * sy + dy) * alt.stride + (x_o + x) * sx;
-                for index in row..row + sx {
-                    sum += i16::from(*get_dbg(alt.source, index))
-                        - i16::from(*get_dbg(alt.denoised, index));
+        let row_start = values.len();
+        values.resize(row_start + w, 0);
+        for dy in 0..sy {
+            let row = ((y_o + y) * sy + dy) * alt.stride + (x_o + win.x0) * sx;
+            let source = get_dbg(alt.source, row..row + w * sx);
+            let denoised = get_dbg(alt.denoised, row..row + w * sx);
+            let pixels = source.chunks_exact(sx).zip(denoised.chunks_exact(sx));
+            for (sum, (s, d)) in get_dbg_mut(values, row_start..).iter_mut().zip(pixels) {
+                for (&s, &d) in s.iter().zip(d) {
+                    *sum += i16::from(s) - i16::from(d);
                 }
             }
-            values.push(sum);
         }
     }
     let (half_x, half_y) = (0.5f64 * alt.dec.0 as f64, 0.5f64 * alt.dec.1 as f64);
@@ -190,7 +193,7 @@ fn alt_input(alt: &Alt, (x_o, y_o): (usize, usize), win: &Window, values: &mut V
 
 /// Integer dot product; the caller keeps the sum inside i32.
 #[cfg(target_arch = "x86_64")]
-fn dot(a: &[i16], b: &[i16]) -> i32 {
+pub(super) fn dot(a: &[i16], b: &[i16]) -> i32 {
     use std::arch::x86_64::{
         __m128i, _mm_add_epi32, _mm_cvtsi128_si32, _mm_loadu_si128, _mm_madd_epi16,
         _mm_setzero_si128, _mm_shuffle_epi32,
@@ -218,7 +221,7 @@ fn dot(a: &[i16], b: &[i16]) -> i32 {
 
 /// Integer dot product; the caller keeps the sum inside i32.
 #[cfg(not(target_arch = "x86_64"))]
-fn dot(a: &[i16], b: &[i16]) -> i32 {
+pub(super) fn dot(a: &[i16], b: &[i16]) -> i32 {
     a.iter()
         .zip(b)
         .map(|(&x, &y)| i32::from(x) * i32::from(y))

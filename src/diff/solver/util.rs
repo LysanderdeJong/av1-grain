@@ -1,11 +1,14 @@
 use std::ptr;
 
+use arrayvec::ArrayVec;
 use v_frame::plane::Plane;
 
-#[cfg(test)]
-use crate::util::get_dbg_mut;
+use super::gram::dot;
 
-use crate::{diff::BLOCK_SIZE, util::get_dbg};
+use crate::{
+    diff::BLOCK_SIZE,
+    util::{get_dbg, get_dbg_mut},
+};
 
 /// Solves Ax = b, where x and b are column vectors of size nx1 and A is nxn
 #[allow(clippy::many_single_char_names)]
@@ -274,23 +277,39 @@ impl DiffPlane {
         let source_origin = get_dbg(source.data(), source.geometry().data_origin()..);
         let denoised_origin = get_dbg(denoised.data(), denoised.geometry().data_origin()..);
         let stride = source.geometry().stride();
-        let (mut sum, mut sum_u, mut sum_v, mut sum_uu, mut sum_vv) =
-            (0f64, 0f64, 0f64, 0f64, 0f64);
+        // Doubled centred coordinates are integers, so every sum is exact: the same f64 values
+        // the per-pixel f64 sums gave, from integer dot products.
+        let doubled = |i: usize, len: usize| (2 * i) as i16 - (len as i16 - 1);
+        let us = (0..max_w)
+            .map(|x| doubled(x, max_w))
+            .collect::<ArrayVec<i16, BLOCK_SIZE>>();
+        let ones = [1i16; BLOCK_SIZE];
+        let ones = get_dbg(&ones, ..max_w);
+        let mut diffs = [0i16; BLOCK_SIZE];
+        let diffs = get_dbg_mut(&mut diffs, ..max_w);
+        let (mut sum, mut sum_u2, mut sum_v2) = (0i64, 0i64, 0i64);
         for y in 0..max_h {
-            let v = y as f64 - cy;
             let row_start = (y_o + y) * stride + x_o;
             let source_row = get_dbg(source_origin, row_start..row_start + max_w);
             let denoised_row = get_dbg(denoised_origin, row_start..row_start + max_w);
-            for (x, (source, denoised)) in source_row.iter().zip(denoised_row.iter()).enumerate() {
-                let u = x as f64 - cx;
-                let d = f64::from(*source) - f64::from(*denoised);
-                sum += d;
-                sum_u += u * d;
-                sum_v += v * d;
-                sum_uu += u * u;
-                sum_vv += v * v;
+            for (diff, (source, denoised)) in
+                diffs.iter_mut().zip(source_row.iter().zip(denoised_row))
+            {
+                *diff = i16::from(*source) - i16::from(*denoised);
             }
+            let row_sum = i64::from(dot(diffs, ones));
+            sum += row_sum;
+            sum_u2 += i64::from(dot(diffs, &us));
+            sum_v2 += row_sum * i64::from(doubled(y, max_h));
         }
+        let square_sum = |len: usize| {
+            (0..len)
+                .map(|i| f64::from(doubled(i, len)).powi(2))
+                .sum::<f64>()
+        };
+        let (sum, sum_u, sum_v) = (sum as f64, sum_u2 as f64 / 2f64, sum_v2 as f64 / 2f64);
+        let sum_uu = square_sum(max_w) * max_h as f64 / 4f64;
+        let sum_vv = square_sum(max_h) * max_w as f64 / 4f64;
         let slope = |num: f64, den: f64| if den > 0f64 { num / den } else { 0f64 };
         Self {
             samples: max_w * max_h,
@@ -348,4 +367,76 @@ pub(super) fn get_noise_var(
 
     let noise_mean = noise_sum as f64 / (max_w * max_h) as f64;
     noise_mean.mul_add(-noise_mean, noise_var_sum as f64 / (max_w * max_h) as f64)
+}
+
+#[cfg(test)]
+mod tests {
+    use v_frame::{chroma::ChromaSubsampling, frame::FrameBuilder};
+
+    use super::*;
+
+    /// The plane fit as the per-pixel f64 sums computed it.
+    #[allow(clippy::indexing_slicing, reason = "test reference")]
+    fn f64_fit(
+        source: &Plane<u8>,
+        denoised: &Plane<u8>,
+        (w, h): (usize, usize),
+        (x_o, y_o): (usize, usize),
+    ) -> [f64; 3] {
+        let (max_w, max_h) = ((w - x_o).min(BLOCK_SIZE), (h - y_o).min(BLOCK_SIZE));
+        let (cx, cy) = ((max_w as f64 - 1.0) / 2.0, (max_h as f64 - 1.0) / 2.0);
+        let px = |p: &Plane<u8>, x: usize, y: usize| {
+            p.data()[p.geometry().data_origin() + y * p.geometry().stride() + x]
+        };
+        let (mut sum, mut su, mut sv, mut suu, mut svv) = (0f64, 0f64, 0f64, 0f64, 0f64);
+        for y in 0..max_h {
+            for x in 0..max_w {
+                let (u, v) = (x as f64 - cx, y as f64 - cy);
+                let d = f64::from(px(source, x_o + x, y_o + y))
+                    - f64::from(px(denoised, x_o + x, y_o + y));
+                sum += d;
+                su += u * d;
+                sv += v * d;
+                suu += u * u;
+                svv += v * v;
+            }
+        }
+        let slope = |num: f64, den: f64| if den > 0f64 { num / den } else { 0f64 };
+        [sum / (max_w * max_h) as f64, slope(su, suu), slope(sv, svv)]
+    }
+
+    #[test]
+    fn integer_plane_fit_is_bit_identical_to_the_f64_sums() {
+        let (w, h) = (100usize, 70usize);
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut byte = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 56) as u8
+        };
+        let mut src = FrameBuilder::new(w, h, ChromaSubsampling::Monochrome, 8)
+            .build()
+            .expect("monochrome frame builds");
+        let mut den = src.clone();
+        let pixels = std::iter::repeat_with(&mut byte)
+            .take(w * h)
+            .collect::<Vec<_>>();
+        src.y_plane.copy_from_slice(&pixels).expect("plane fits");
+        let pixels = std::iter::repeat_with(&mut byte)
+            .take(w * h)
+            .collect::<Vec<_>>();
+        den.y_plane.copy_from_slice(&pixels).expect("plane fits");
+        // Full blocks and blocks cut off at the right and bottom edges.
+        for (x_o, y_o) in [(0, 0), (32, 32), (64, 0), (0, 64), (96, 64), (75, 50)] {
+            let fit = DiffPlane::fit(&src.y_plane, &den.y_plane, (w, h), x_o, y_o, 32, 32);
+            let want = f64_fit(&src.y_plane, &den.y_plane, (w, h), (x_o, y_o));
+            let got = [fit.mean, fit.gx, fit.gy];
+            assert_eq!(
+                got.map(f64::to_bits),
+                want.map(f64::to_bits),
+                "block at {x_o},{y_o}"
+            );
+        }
+    }
 }
